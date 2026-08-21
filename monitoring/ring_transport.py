@@ -63,6 +63,7 @@ _HOOK_DEFS = _ext.HOOK_DEFS
 GROUP_ATTN, GROUP_MLP, GROUP_OTHER = 0, 1, 2
 SHAPE_HIDDEN, SHAPE_QKV_Q, SHAPE_QKV_KV, SHAPE_QKV_Z = 0, 1, 2, 3
 SHAPE_ATTN_WT, SHAPE_MLP_POST, SHAPE_TOKEN_IDS, SHAPE_LOGITS = 4, 5, 6, 7
+SHAPE_ATTN_SUMMARY = 11
 PP_ANY, PP_FIRST, PP_LAST = 0, 1, 2
 
 
@@ -188,6 +189,7 @@ class ModelShapeConfig:
     intermediate_dim: int = 0  # MLP intermediate size (for mlp_post shape)
     num_experts:  int = 0  # router_logits final dim
     top_k:        int = 0  # topk_ids / topk_weights final dim
+    attn_summary_width: int = 0  # exact AttnSketch scalars per query/head
     tp_size:      int = 1  # tensor parallel world size
     tp_rank:      int = 0  # this rank's TP index
 
@@ -359,6 +361,10 @@ def _compute_hook_shape(
         return b + [q_len, cfg.num_heads // tp, cfg.head_dim]
     if hook_type in (HOOK_TYPE_ATTN_SCORES, HOOK_TYPE_PATTERN):
         return b + [cfg.num_heads // tp, q_len, kv_dim]
+    if hook_type == HOOK_TYPE_ATTN_SUMMARY:
+        if cfg.attn_summary_width < 1:
+            return []
+        return b + [q_len, cfg.num_heads // tp, cfg.attn_summary_width]
     if hook_type == HOOK_TYPE_MLP_POST:
         if cfg.intermediate_dim == 0:
             return []  # intermediate_dim unknown -- skip this hook

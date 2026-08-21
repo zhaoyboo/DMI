@@ -51,7 +51,8 @@ enum HookType : int {
     HOOK_TYPE_ROUTER_LOGITS= 21,
     HOOK_TYPE_TOPK_IDS     = 22,
     HOOK_TYPE_TOPK_WEIGHTS = 23,
-    HOOK_TYPE_COUNT        = 24,
+    HOOK_TYPE_ATTN_SUMMARY = 24,
+    HOOK_TYPE_COUNT        = 25,
 };
 
 // Hook group — which sub-block produces this tensor.
@@ -69,10 +70,12 @@ enum HookGroup : int { GROUP_ATTN = 0, GROUP_MLP = 1, GROUP_OTHER = 2 };
 //   SHAPE_ROUTER_LOGITS : [batch, q_len, num_experts]
 //   SHAPE_TOPK_IDS      : [batch, q_len, top_k]
 //   SHAPE_TOPK_WEIGHTS  : [batch, q_len, top_k]
+//   SHAPE_ATTN_SUMMARY  : [batch, q_len, num_heads/tp, summary_width]
 enum ShapeClass : int {
     SHAPE_HIDDEN = 0, SHAPE_QKV_Q = 1, SHAPE_QKV_KV = 2, SHAPE_QKV_Z = 3,
     SHAPE_ATTN_WT = 4, SHAPE_MLP_POST = 5, SHAPE_TOKEN_IDS = 6, SHAPE_LOGITS = 7,
     SHAPE_ROUTER_LOGITS = 8, SHAPE_TOPK_IDS = 9, SHAPE_TOPK_WEIGHTS = 10,
+    SHAPE_ATTN_SUMMARY = 11,
 };
 
 // Pipeline-parallel stage placement.
@@ -114,6 +117,7 @@ static constexpr HookDef HOOK_DEFS[] = {
     {HOOK_TYPE_ROUTER_LOGITS,"mlp.hook_router_logits",  "router_logits",true,  GROUP_OTHER, false, SHAPE_ROUTER_LOGITS, PP_ANY },
     {HOOK_TYPE_TOPK_IDS,    "mlp.hook_topk_ids",        "topk_ids",     true,  GROUP_OTHER, false, SHAPE_TOPK_IDS, PP_ANY },
     {HOOK_TYPE_TOPK_WEIGHTS,"mlp.hook_topk_weights",    "topk_weights", true,  GROUP_OTHER, false, SHAPE_TOPK_WEIGHTS, PP_ANY },
+    {HOOK_TYPE_ATTN_SUMMARY,"attn.attnsketch_summary",  "attn_summary", true,  GROUP_ATTN,  true,  SHAPE_ATTN_SUMMARY, PP_ANY },
 };
 static constexpr int HOOK_DEFS_COUNT = sizeof(HOOK_DEFS) / sizeof(HOOK_DEFS[0]);
 

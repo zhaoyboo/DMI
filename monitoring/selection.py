@@ -27,6 +27,7 @@ from .ring_transport import (
     HOOK_TYPE_ROUTER_LOGITS,
     HOOK_TYPE_TOPK_IDS,
     HOOK_TYPE_TOPK_WEIGHTS,
+    HOOK_TYPE_ATTN_SUMMARY,
     PP_FIRST_ONLY,
     PP_LAST_ONLY,
     TP_SHARDED_TYPES,
@@ -131,6 +132,8 @@ def select_hook_specs(
         if cfg.top_k == 0:
             unavailable.add(HOOK_TYPE_TOPK_IDS)
             unavailable.add(HOOK_TYPE_TOPK_WEIGHTS)
+        if cfg.attn_summary_width == 0:
+            unavailable.add(HOOK_TYPE_ATTN_SUMMARY)
     return [
         spec
         for spec in specs
@@ -165,6 +168,8 @@ def apply_hook_selection(
         if cfg.top_k == 0:
             unavailable.add(HOOK_TYPE_TOPK_IDS)
             unavailable.add(HOOK_TYPE_TOPK_WEIGHTS)
+        if cfg.attn_summary_width == 0:
+            unavailable.add(HOOK_TYPE_ATTN_SUMMARY)
 
     for spec in specs:
         if spec.module is None:
