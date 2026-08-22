@@ -136,3 +136,27 @@ def test_attnsketch_export_rejects_stale_page_epoch():
         assert "attribution mismatch" in str(exc)
     else:
         raise AssertionError("stale page-table epoch was accepted")
+
+
+def test_argmax_token_metrics_preserve_request_and_page_epochs():
+    provenance = AttnSketchCaptureProvenance(
+        kernel_fingerprint=_digest("1"),
+        artifact_hash=_digest("1"),
+        manifest_version="fa2-v2.8.3-sm80-argmax-token-pmax-r1",
+        score_semantics_hash=_digest("3"),
+        semantic_mapping_version="fa2-argmax-token-pmax-v1",
+        layout_hash=_digest("4"),
+        query_contract_hash=_digest("5"),
+        metrics=("argmax_logical_token_f32", "p_max"),
+    )
+    registry = AttnSketchProvenanceRegistry([provenance])
+    encoded = AttnSketchRequestBinding("req-token", 9, 12).encode()
+    validate_attnsketch_export_identity(
+        model_id=provenance.capture_id,
+        request_id=encoded,
+        registry=registry,
+        expected_provenance=provenance,
+        expected_request_id="req-token",
+        expected_request_table_epoch=9,
+        expected_page_table_epoch=12,
+    )

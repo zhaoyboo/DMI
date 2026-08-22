@@ -27,3 +27,9 @@ does not repeat large fingerprints in every query/head payload.
 This branch does not yet install a FlashAttention model adapter that fires the
 hook. That adapter belongs to AttnSketch-lib and must be pinned to a validated
 kernel manifest.
+
+The transport is metric-agnostic. The pinned positional adapter uses width 2
+with metrics `("argmax_logical_token_f32", "p_max")`. Its token index is
+transported as FP32 only because the manifested sequence length is below
+`2**24`; the capture layout hash and metric tuple make that convention
+explicit. DMI does not convert, reconstruct, or reinterpret either field.
