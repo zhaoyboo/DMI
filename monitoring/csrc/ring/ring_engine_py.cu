@@ -156,6 +156,24 @@ void RingEnginePy::push_step_template(uint64_t template_id) {
     impl_->fifo.push_step(context, metas);
 }
 
+void RingEnginePy::rebind_and_push_step_template(
+    uint64_t template_id, StepContext* ctx) {
+    std::unique_ptr<StepContext> owned(ctx);
+    auto* context = static_cast<StepContext*>(nullptr);
+    std::vector<TensorMeta> metas;
+    {
+        std::lock_guard<std::mutex> lock(impl_->template_mu);
+        const auto it = impl_->step_templates.find(template_id);
+        if (it == impl_->step_templates.end()) {
+            throw std::invalid_argument("unknown DMI step template");
+        }
+        it->second.context = *owned;
+        context = new StepContext(it->second.context);
+        metas = it->second.metas;
+    }
+    impl_->fifo.push_step(context, metas);
+}
+
 // ---------------------------------------------------------------------------
 // hook_no_notify (3 variants) -- unconditional producer launches.
 //

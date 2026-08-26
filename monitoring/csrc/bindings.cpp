@@ -84,12 +84,7 @@ struct ParsedStepMetadata {
   std::vector<ring_py::TensorMeta> metas;
 };
 
-ParsedStepMetadata parse_step_metadata(
-    py::list hook_types_py,
-    py::list layer_nos_py,
-    py::list shapes_py,
-    py::list dtypes_py,
-    py::list flags_py,
+std::unique_ptr<ring_py::StepContext> parse_step_context(
     const std::string& model_id,
     int32_t tp_rank,
     int32_t dp_rank,
@@ -100,9 +95,8 @@ ParsedStepMetadata parse_step_metadata(
     py::list token_ranges_py,
     py::list dim0_offsets_py,
     py::list kv_offsets_py) {
-  ParsedStepMetadata parsed;
-  parsed.context = std::make_unique<ring_py::StepContext>();
-  auto& ctx = *parsed.context;
+  auto context = std::make_unique<ring_py::StepContext>();
+  auto& ctx = *context;
   ctx.model_id = model_id;
   ctx.tp_rank = tp_rank;
   ctx.dp_rank = dp_rank;
@@ -122,6 +116,29 @@ ParsedStepMetadata parse_step_metadata(
     }
     ctx.requests.push_back(std::move(request));
   }
+  return context;
+}
+
+ParsedStepMetadata parse_step_metadata(
+    py::list hook_types_py,
+    py::list layer_nos_py,
+    py::list shapes_py,
+    py::list dtypes_py,
+    py::list flags_py,
+    const std::string& model_id,
+    int32_t tp_rank,
+    int32_t dp_rank,
+    int32_t ep_rank,
+    int32_t pp_rank,
+    bool flattened,
+    py::list req_ids_py,
+    py::list token_ranges_py,
+    py::list dim0_offsets_py,
+    py::list kv_offsets_py) {
+  ParsedStepMetadata parsed;
+  parsed.context = parse_step_context(
+      model_id, tp_rank, dp_rank, ep_rank, pp_rank, flattened,
+      req_ids_py, token_ranges_py, dim0_offsets_py, kv_offsets_py);
 
   const size_t count = static_cast<size_t>(py::len(hook_types_py));
   parsed.metas.reserve(count);
@@ -578,6 +595,34 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &ring_py::RingEnginePy::push_step_template,
            py::arg("template_id"),
            py::call_guard<py::gil_scoped_release>())
+      .def("rebind_and_push_step_template",
+           [](ring_py::RingEnginePy& self,
+              uint64_t template_id,
+              const std::string& model_id,
+              int32_t tp_rank,
+              int32_t dp_rank,
+              int32_t ep_rank,
+              int32_t pp_rank,
+              bool flattened,
+              py::list req_ids_py,
+              py::list token_ranges_py,
+              py::list dim0_offsets_py,
+              py::list kv_offsets_py) {
+             auto context = parse_step_context(
+                 model_id, tp_rank, dp_rank, ep_rank, pp_rank, flattened,
+                 req_ids_py, token_ranges_py, dim0_offsets_py, kv_offsets_py);
+             py::gil_scoped_release release;
+             self.rebind_and_push_step_template(
+                 template_id, context.release());
+           },
+           py::arg("template_id"),
+           py::arg("model_id"),
+           py::arg("tp_rank"), py::arg("dp_rank"),
+           py::arg("ep_rank"), py::arg("pp_rank"),
+           py::arg("flattened"),
+           py::arg("req_ids"), py::arg("token_ranges"),
+           py::arg("dim0_offsets"),
+           py::arg("kv_offsets") = py::list())
       .def("set_null_mode",
            &ring_py::RingEnginePy::set_null_mode,
            py::arg("enabled"),

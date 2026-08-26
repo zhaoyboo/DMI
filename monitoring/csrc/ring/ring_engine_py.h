@@ -79,6 +79,12 @@ public:
         uint64_t template_id, StepContext* ctx,
         std::vector<TensorMeta>& metas);
     void push_step_template(uint64_t template_id);
+    // Atomically replace only the dynamic request/rank context and enqueue a
+    // clone of the fixed-topology template.  The TensorMeta vector remains
+    // immutable, avoiding per-step hook/shape/dtype reconstruction for
+    // request-scoped AttnSketch records.
+    void rebind_and_push_step_template(
+        uint64_t template_id, StepContext* ctx);
 
     // Launch producer kernel unconditionally (no condition gating).
     // Space must be guaranteed by pre-forward capacity check.

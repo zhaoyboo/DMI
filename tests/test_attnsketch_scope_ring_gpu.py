@@ -170,12 +170,13 @@ def test_scope_summary_traverses_real_gpu_ring_without_mutating_source(
         deactivate()
 
 
-def test_cached_scope_metadata_traverses_ring_and_fails_on_context_drift() -> None:
+def test_cached_scope_metadata_combined_rebind_traverses_real_ring() -> None:
     config = _native_engine.RingConfig()
     config.task_ring_entries = 1024
     config.payload_ring_bytes = 1024 * 1024
     config.pinned_staging_bytes = 1024 * 1024
-    engine = _native_engine.RingEngine(config, None)
+    sink = _native_engine.InMemoryRingSink()
+    engine = _native_engine.RingEngine(config, sink)
     engine.init()
     engine.start()
     transport = RingTransport(engine)
@@ -234,13 +235,24 @@ def test_cached_scope_metadata_traverses_ring_and_fails_on_context_drift() -> No
             kv_offsets=[32],
             flattened=False,
         )
-        template.rebind(expected_requests=rebound_requests)
         assert engine.prepare_step(source.nbytes, 1) != 2
-        template.push()
+        template.rebind_and_push(expected_requests=rebound_requests)
         transport.submit_attnsketch_scope_summary(source)
         engine.notify_drain()
         engine.flush_and_wait()
         assert template.expected_requests == rebound_requests
+        rows = sink.rows()
+        assert len(rows) == 2
+        assert rows[0]["request_id"] == AttnSketchRequestBinding(
+            *expected_requests[0]
+        ).encode()
+        assert rows[1]["request_id"] == AttnSketchRequestBinding(
+            *rebound_requests[0]
+        ).encode()
+        assert (rows[0]["start_token"], rows[0]["end_token"]) == (4095, 4096)
+        assert (rows[1]["start_token"], rows[1]["end_token"]) == (8191, 8192)
+        assert torch.equal(rows[0]["tensor"], source.cpu())
+        assert torch.equal(rows[1]["tensor"], source.cpu())
 
         transport._current_token_ranges = [(8190, 8191)]
         with pytest.raises(ValueError, match="token ranges"):

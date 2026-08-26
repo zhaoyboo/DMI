@@ -713,10 +713,58 @@ class RingTransport:
         kv_dim: int,
         logits_to_keep: int = 0,
     ) -> "AttnSketchBoundScopeMetaTemplate":
-        """Precompile one immutable AttnSketch DMI metadata record.
+        """Precompile one immutable scope-summary DMI metadata record."""
+
+        return self._register_attnsketch_bound_meta_template(
+            hook_type=HOOK_TYPE_ATTN_SCOPE_SUMMARY,
+            hook_name="scope-summary",
+            capture_id=capture_id,
+            expected_requests=expected_requests,
+            batch=batch,
+            q_len=q_len,
+            kv_dim=kv_dim,
+            logits_to_keep=logits_to_keep,
+        )
+
+    def register_attnsketch_bound_token_focus_meta_template(
+        self,
+        *,
+        capture_id: str,
+        expected_requests: tuple[tuple[str, int, int], ...],
+        batch: int,
+        q_len: int,
+        kv_dim: int,
+        logits_to_keep: int = 0,
+    ) -> "AttnSketchBoundScopeMetaTemplate":
+        """Precompile one immutable exact token-focus metadata record."""
+
+        return self._register_attnsketch_bound_meta_template(
+            hook_type=HOOK_TYPE_ATTN_TOKEN_FOCUS,
+            hook_name="token-focus",
+            capture_id=capture_id,
+            expected_requests=expected_requests,
+            batch=batch,
+            q_len=q_len,
+            kv_dim=kv_dim,
+            logits_to_keep=logits_to_keep,
+        )
+
+    def _register_attnsketch_bound_meta_template(
+        self,
+        *,
+        hook_type: int,
+        hook_name: str,
+        capture_id: str,
+        expected_requests: tuple[tuple[str, int, int], ...],
+        batch: int,
+        q_len: int,
+        kv_dim: int,
+        logits_to_keep: int,
+    ) -> "AttnSketchBoundScopeMetaTemplate":
+        """Precompile one immutable request-scoped DMI metadata record.
 
         The fast path is intentionally narrow: exactly one request-scoped
-        summary hook, fixed request ordering, fixed token ranges, and fixed
+        hook, fixed request ordering, fixed token ranges, and fixed
         rank/layout context. Any drift fails before the cached metadata is
         pushed. Other DMI hook mixtures continue to use ``pre_push_all_metas``.
         """
@@ -729,9 +777,9 @@ class RingTransport:
         if cfg is None:
             raise RuntimeError("AttnSketch metadata template requires model shape")
         specs = tuple(self._active_specs)
-        if len(specs) != 1 or specs[0].hook_type != HOOK_TYPE_ATTN_SCOPE_SUMMARY:
+        if len(specs) != 1 or specs[0].hook_type != hook_type:
             raise ValueError(
-                "cached AttnSketch metadata requires one scope-summary hook"
+                f"cached AttnSketch metadata requires one {hook_name} hook"
             )
         requests = self._current_req_ids
         token_ranges = self._current_token_ranges
@@ -742,7 +790,7 @@ class RingTransport:
         if request_rows != len(requests):
             raise ValueError("AttnSketch metadata template request-row mismatch")
         shape = _compute_hook_shape(
-            HOOK_TYPE_ATTN_SCOPE_SUMMARY,
+            hook_type,
             cfg,
             batch,
             q_len,
@@ -754,7 +802,7 @@ class RingTransport:
         dtype = specs[0].dtype if specs[0].dtype is not None else cfg.dtype
         kv_offsets = self._current_kv_offsets or []
         template_id = self._ring_engine.register_step_template(
-            [HOOK_TYPE_ATTN_SCOPE_SUMMARY],
+            [hook_type],
             [specs[0].layer_no],
             [shape],
             [dtype],
@@ -787,6 +835,7 @@ class RingTransport:
                 self._current_flattened,
             ),
             expected_spec=specs[0],
+            expected_hook_type=hook_type,
             expected_model_cfg=cfg,
             expected_shape=tuple(shape),
             expected_dtype=dtype,
@@ -1000,25 +1049,21 @@ class AttnSketchBoundScopeMetaTemplate:
     expected_kv_offsets: tuple[int, ...]
     expected_rank_layout: tuple[int, int, int, int, bool]
     expected_spec: HookSpec
+    expected_hook_type: int
     expected_model_cfg: ModelShapeConfig
     expected_shape: tuple[int, ...]
     expected_dtype: torch.dtype
 
-    def rebind(
+    def _validated_dynamic_context(
         self,
         *,
         expected_requests: tuple[tuple[str, int, int], ...],
-    ) -> None:
-        """Atomically replace dynamic request attribution for later pushes.
-
-        Scheduler-level rollback/ABA checks happen before this method.  This
-        transport boundary independently verifies that the current encoded
-        request IDs match ``expected_requests`` and that no fixed-topology
-        field drifted.  The native template is replaced under the same mutex
-        used by ``push_step_template``; a push observes either the old record
-        or the complete new record, never a partially rewritten one.
-        """
-
+    ) -> tuple[
+        tuple[str, ...],
+        tuple[tuple[int, int], ...],
+        tuple[int, ...],
+        tuple[int, ...],
+    ]:
         transport = self.transport
         transport.validate_attnsketch_bound_scope(
             capture_id=self.capture_id,
@@ -1049,10 +1094,48 @@ class AttnSketchBoundScopeMetaTemplate:
             raise ValueError("cached DMI model shape changed")
         if tuple(transport._active_specs) != (self.expected_spec,):
             raise ValueError("cached DMI hook selection changed")
+        return requests, token_ranges, dim0_offsets, kv_offsets
+
+    def _adopt_dynamic_context(
+        self,
+        *,
+        expected_requests: tuple[tuple[str, int, int], ...],
+        requests: tuple[str, ...],
+        token_ranges: tuple[tuple[int, int], ...],
+        dim0_offsets: tuple[int, ...],
+        kv_offsets: tuple[int, ...],
+    ) -> None:
+        self.expected_requests = expected_requests
+        self.expected_req_ids = requests
+        self.expected_token_ranges = token_ranges
+        self.expected_dim0_offsets = dim0_offsets
+        self.expected_kv_offsets = kv_offsets
+
+    def rebind(
+        self,
+        *,
+        expected_requests: tuple[tuple[str, int, int], ...],
+    ) -> None:
+        """Atomically replace dynamic request attribution for later pushes.
+
+        Scheduler-level rollback/ABA checks happen before this method.  This
+        transport boundary independently verifies that the current encoded
+        request IDs match ``expected_requests`` and that no fixed-topology
+        field drifted.  The native template is replaced under the same mutex
+        used by ``push_step_template``; a push observes either the old record
+        or the complete new record, never a partially rewritten one.
+        """
+
+        requests, token_ranges, dim0_offsets, kv_offsets = (
+            self._validated_dynamic_context(
+                expected_requests=expected_requests,
+            )
+        )
+        transport = self.transport
 
         transport._ring_engine.replace_step_template(
             self.template_id,
-            [HOOK_TYPE_ATTN_SCOPE_SUMMARY],
+            [self.expected_hook_type],
             [self.expected_spec.layer_no],
             [list(self.expected_shape)],
             [self.expected_dtype],
@@ -1068,11 +1151,47 @@ class AttnSketchBoundScopeMetaTemplate:
             list(dim0_offsets),
             list(kv_offsets),
         )
-        self.expected_requests = expected_requests
-        self.expected_req_ids = requests
-        self.expected_token_ranges = token_ranges
-        self.expected_dim0_offsets = dim0_offsets
-        self.expected_kv_offsets = kv_offsets
+        self._adopt_dynamic_context(
+            expected_requests=expected_requests,
+            requests=requests,
+            token_ranges=token_ranges,
+            dim0_offsets=dim0_offsets,
+            kv_offsets=kv_offsets,
+        )
+
+    def rebind_and_push(
+        self,
+        *,
+        expected_requests: tuple[tuple[str, int, int], ...],
+    ) -> None:
+        """Replace dynamic attribution and enqueue in one native call."""
+
+        requests, token_ranges, dim0_offsets, kv_offsets = (
+            self._validated_dynamic_context(
+                expected_requests=expected_requests,
+            )
+        )
+        transport = self.transport
+        transport._ring_engine.rebind_and_push_step_template(
+            self.template_id,
+            transport._current_model_id,
+            transport._current_tp_rank,
+            transport._current_dp_rank,
+            transport._current_ep_rank,
+            transport._current_pp_rank,
+            transport._current_flattened,
+            list(requests),
+            list(token_ranges),
+            list(dim0_offsets),
+            list(kv_offsets),
+        )
+        self._adopt_dynamic_context(
+            expected_requests=expected_requests,
+            requests=requests,
+            token_ranges=token_ranges,
+            dim0_offsets=dim0_offsets,
+            kv_offsets=kv_offsets,
+        )
 
     def push(self) -> None:
         """Validate all dynamic context, then clone the native template."""
