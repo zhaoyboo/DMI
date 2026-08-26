@@ -25,6 +25,7 @@ _NATIVE_EXPORTS = (
     "OnClosedPolicy",
     "RingConfig",
     "RingEngine",
+    "InMemoryRingSink",
     "ring_set_active_engine",
     "ring_clear_active_engine",
 )
@@ -40,6 +41,7 @@ def _load_extension() -> Any:
     pkg_dir = Path(__file__).resolve().parent
     repo_root = pkg_dir.parent
     candidates = []
+    load_errors = []
     seen = set()
     search_dirs = (pkg_dir, repo_root)
     for suffix in importlib.machinery.EXTENSION_SUFFIXES:
@@ -63,13 +65,16 @@ def _load_extension() -> Any:
                 spec.loader.exec_module(module)  # type: ignore[arg-type]
                 _EXTENSION_MODULE = module
                 return _EXTENSION_MODULE
-        except Exception:
+        except Exception as exc:
             # Continue searching other local candidates.
-            pass
+            load_errors.append(f"{so_path}: {type(exc).__name__}: {exc}")
 
+    detail = ""
+    if load_errors:
+        detail = " Candidate load failures: " + " | ".join(load_errors)
     raise ImportError(
         "monitoring native backend .so not found in repository. "
-        "Build it first with `make -C monitoring`."
+        "Build it first with `make -C monitoring`." + detail
     )
 
 

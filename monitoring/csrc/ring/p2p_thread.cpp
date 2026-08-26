@@ -139,6 +139,18 @@ void P2PThread::stop() {
     if (thread_.joinable()) thread_.join();
 }
 
+void P2PThread::wait_until_processed(uint64_t target) {
+    std::unique_lock<std::mutex> lock(processed_mu_);
+    processed_cv_.wait(lock, [this, target] {
+        return processed_count_.load(std::memory_order_acquire) >= target;
+    });
+}
+
+void P2PThread::mark_processed() {
+    processed_count_.fetch_add(1, std::memory_order_release);
+    processed_cv_.notify_all();
+}
+
 // ---------------------------------------------------------------------------
 void P2PThread::loop() {
     while (true) {
@@ -160,6 +172,7 @@ void P2PThread::process(std::vector<DrainTask>& tasks) {
             // CPU-direct tensor -- already in pageable memory, skip staging copy
             at::Tensor tensor = std::move(task.cpu_paged_tensor);
             do_post_processing(tensor, task);
+            mark_processed();
             continue;
         }
 
@@ -183,6 +196,7 @@ void P2PThread::process(std::vector<DrainTask>& tasks) {
         }
 
         do_post_processing(tensor, task);
+        mark_processed();
     }
 }
 
@@ -251,6 +265,7 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
     std::string act_name = make_act_name(meta.hook_type, meta.layer_no);
     int32_t shard_rank = resolve_shard_rank(meta.hook_type, *current_ctx_);
     bool is_attn = ring_py::is_attn_weight_matrix(meta.hook_type);
+    bool is_request_scoped = ring_py::is_request_scoped(meta.hook_type);
 
     const auto& requests = current_ctx_->requests;
     bool should_clone = cfg_.clone_slices && requests.size() > 1;
@@ -265,12 +280,10 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
         if (current_ctx_->flattened) {
             // vLLM: packed [total_tokens, ...], right-padded.
             if (is_attn) continue;
-            if (meta.hook_type == ring_py::HOOK_TYPE_FINAL_LOGITS) {
+            if (is_request_scoped) {
                 // Contract: vLLM compute_logits returns exactly one logit
-                // per request, flattened to [num_reqs, vocab].  The meta
-                // shape matches this (logits_to_keep=num_reqs passed from
-                // execute_model).  We index by request position j (not
-                // the token-based dim0_offset) and extract one row.
+                // or scope-summary row per request.  Index by request
+                // position j rather than the token-based dim0_offset.
                 slice = slice_flattened(tensor, /*dim0_offset=*/j,
                                         /*start=*/0, /*end=*/1);
             } else {
@@ -280,10 +293,14 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
         } else {
             // HF: [batch, q_len, ...], left-padded tokens
             if (req.dim0_offset >= tensor.size(0)) break;
-            slice = slice_for_request(
-                tensor, req.dim0_offset,
-                req.start_token, req.end_token, is_attn,
-                req.kv_offset);
+            if (is_request_scoped) {
+                slice = tensor.narrow(0, req.dim0_offset, 1);
+            } else {
+                slice = slice_for_request(
+                    tensor, req.dim0_offset,
+                    req.start_token, req.end_token, is_attn,
+                    req.kv_offset);
+            }
         }
 
         // final_logits: the tensor's dim0 is logits_to_keep (often 1),
@@ -296,6 +313,12 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
             int64_t logits_count = slice.size(0);
             db_start = req.end_token - static_cast<int32_t>(logits_count);
             db_end   = req.end_token;
+        }
+        if ((meta.hook_type == ring_py::HOOK_TYPE_ATTN_SCOPE_SUMMARY ||
+             meta.hook_type == ring_py::HOOK_TYPE_ATTN_TOKEN_FOCUS)
+            && slice.defined()) {
+            db_start = req.end_token - 1;
+            db_end = req.end_token;
         }
         if (!slice.defined()) {
             continue;

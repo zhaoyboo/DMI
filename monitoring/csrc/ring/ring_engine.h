@@ -24,6 +24,7 @@ public:
     void init(cudaStream_t stream = 0);
     void start();
     void stop();
+    void flush_and_wait();
 
     RingState&   ring_state()    { return ring_.state(); }
     DrainThread& drain_thread()  { return *drain_; }

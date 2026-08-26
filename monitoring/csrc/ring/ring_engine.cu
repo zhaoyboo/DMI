@@ -57,11 +57,17 @@ void RingEngine::stop() {
     if (!drain_->is_running()) return;
 
     cudaDeviceSynchronize();
-    drain_->force_flush_and_wait();
+    flush_and_wait();
 
     drain_->stop();
     drain_->signal_p2p_stop();
     p2p_->stop();
+}
+
+void RingEngine::flush_and_wait() {
+    drain_->force_flush_and_wait();
+    const uint64_t target = drain_->p2p_submitted_count();
+    p2p_->wait_until_processed(target);
 }
 
 }  // namespace ring

@@ -3,6 +3,7 @@
 #include <torch/extension.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <mutex>
 namespace py = pybind11;
 
 #include "clickhouse_client.h"
@@ -10,6 +11,137 @@ namespace py = pybind11;
 #include "ring/ring_engine_py.h"
 #include "ring/ring_torch_op.h"
 #include "ring/tensor_meta.h"
+
+namespace {
+
+struct CapturedRingRow {
+  std::string model_id;
+  int32_t shard_rank = 0;
+  std::string request_id;
+  std::string activation_name;
+  int32_t layer_no = -1;
+  int32_t start_token = 0;
+  int32_t end_token = 0;
+  at::Tensor tensor;
+};
+
+class InMemoryRingSink {
+ public:
+  void submit(const std::string& model_id, int32_t shard_rank,
+              const std::string& request_id,
+              const std::string& activation_name, int32_t layer_no,
+              int32_t start_token, int32_t end_token, at::Tensor tensor) {
+    CapturedRingRow row;
+    row.model_id = model_id;
+    row.shard_rank = shard_rank;
+    row.request_id = request_id;
+    row.activation_name = activation_name;
+    row.layer_no = layer_no;
+    row.start_token = start_token;
+    row.end_token = end_token;
+    // The ring reuses pinned staging.  This diagnostic sink deliberately
+    // owns a clone so later drains cannot mutate already captured evidence.
+    row.tensor = tensor.clone();
+    std::lock_guard<std::mutex> lock(mu_);
+    rows_.push_back(std::move(row));
+  }
+
+  py::list rows() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    py::list result;
+    for (const auto& row : rows_) {
+      py::dict item;
+      item["model_id"] = row.model_id;
+      item["shard_rank"] = row.shard_rank;
+      item["request_id"] = row.request_id;
+      item["activation_name"] = row.activation_name;
+      item["layer_no"] = row.layer_no;
+      item["start_token"] = row.start_token;
+      item["end_token"] = row.end_token;
+      item["tensor"] = row.tensor;
+      result.append(std::move(item));
+    }
+    return result;
+  }
+
+  size_t size() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return rows_.size();
+  }
+
+  void clear() {
+    std::lock_guard<std::mutex> lock(mu_);
+    rows_.clear();
+  }
+
+ private:
+  mutable std::mutex mu_;
+  std::vector<CapturedRingRow> rows_;
+};
+
+struct ParsedStepMetadata {
+  std::unique_ptr<ring_py::StepContext> context;
+  std::vector<ring_py::TensorMeta> metas;
+};
+
+ParsedStepMetadata parse_step_metadata(
+    py::list hook_types_py,
+    py::list layer_nos_py,
+    py::list shapes_py,
+    py::list dtypes_py,
+    py::list flags_py,
+    const std::string& model_id,
+    int32_t tp_rank,
+    int32_t dp_rank,
+    int32_t ep_rank,
+    int32_t pp_rank,
+    bool flattened,
+    py::list req_ids_py,
+    py::list token_ranges_py,
+    py::list dim0_offsets_py,
+    py::list kv_offsets_py) {
+  ParsedStepMetadata parsed;
+  parsed.context = std::make_unique<ring_py::StepContext>();
+  auto& ctx = *parsed.context;
+  ctx.model_id = model_id;
+  ctx.tp_rank = tp_rank;
+  ctx.dp_rank = dp_rank;
+  ctx.ep_rank = ep_rank;
+  ctx.pp_rank = pp_rank;
+  ctx.flattened = flattened;
+  ctx.requests.reserve(static_cast<size_t>(py::len(req_ids_py)));
+  for (size_t i = 0; i < static_cast<size_t>(py::len(req_ids_py)); ++i) {
+    ring_py::RequestMeta request;
+    request.req_id = py::cast<std::string>(req_ids_py[i]);
+    py::tuple token_range = token_ranges_py[i].cast<py::tuple>();
+    request.start_token = py::cast<int32_t>(token_range[0]);
+    request.end_token = py::cast<int32_t>(token_range[1]);
+    request.dim0_offset = py::cast<int64_t>(dim0_offsets_py[i]);
+    if (i < static_cast<size_t>(py::len(kv_offsets_py))) {
+      request.kv_offset = py::cast<int32_t>(kv_offsets_py[i]);
+    }
+    ctx.requests.push_back(std::move(request));
+  }
+
+  const size_t count = static_cast<size_t>(py::len(hook_types_py));
+  parsed.metas.reserve(count);
+  for (size_t i = 0; i < count; ++i) {
+    ring_py::TensorMeta meta;
+    meta.hook_type = py::cast<int>(hook_types_py[i]);
+    meta.layer_no = py::cast<int>(layer_nos_py[i]);
+    meta.dtype = static_cast<int>(dtypes_py[i].cast<at::ScalarType>());
+    meta.last_in_step = (i == count - 1);
+    meta.flags = static_cast<uint8_t>(py::cast<int>(flags_py[i]));
+    py::list shape = shapes_py[i].cast<py::list>();
+    for (auto dimension : shape) {
+      meta.shape.push_back(py::cast<int64_t>(dimension));
+    }
+    parsed.metas.push_back(std::move(meta));
+  }
+  return parsed;
+}
+
+}  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // ---- Hook definitions (single source of truth from C++ HOOK_DEFS table) ----
@@ -258,27 +390,49 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readwrite("insert_queue_max_bytes",    &ring_py::RingConfig::insert_queue_max_bytes)
       .def_readwrite("insert_queue_max_items",    &ring_py::RingConfig::insert_queue_max_items);
 
+  py::class_<InMemoryRingSink, std::shared_ptr<InMemoryRingSink>>(
+      m, "InMemoryRingSink")
+      .def(py::init<>())
+      .def("rows", &InMemoryRingSink::rows)
+      .def("size", &InMemoryRingSink::size)
+      .def("clear", &InMemoryRingSink::clear);
+
   py::class_<ring_py::RingEnginePy, std::shared_ptr<ring_py::RingEnginePy>>(m, "RingEngine")
       .def(py::init([](ring_py::RingConfig cfg, py::object host_engine_obj) {
              ring_py::SubmitFn submit_fn;
              if (!host_engine_obj.is_none()) {
-                 auto host = host_engine_obj.cast<std::shared_ptr<dmx_host::DMXHostEngine>>();
-                 submit_fn = [host](const std::string& model_id, int32_t shard_rank,
-                                    const std::string& req_id, const std::string& act_name,
-                                    int32_t layer_no, int32_t start_token, int32_t end_token,
-                                    at::Tensor slice) {
-                     dmx_host::ClickHouseRow row;
-                     row.emplace_back(model_id);
-                     row.emplace_back(req_id);
-                     row.emplace_back(act_name);
-                     row.emplace_back(layer_no);
-                     row.emplace_back(shard_rank);
-                     row.emplace_back(start_token);
-                     row.emplace_back(end_token);
-                     uint64_t nbytes = static_cast<uint64_t>(slice.nbytes());
-                     row.emplace_back(std::move(slice));
-                     host->submit_direct(std::move(row), nbytes);
-                 };
+                 if (py::isinstance<dmx_host::DMXHostEngine>(host_engine_obj)) {
+                   auto host = host_engine_obj.cast<std::shared_ptr<dmx_host::DMXHostEngine>>();
+                   submit_fn = [host](const std::string& model_id, int32_t shard_rank,
+                                      const std::string& req_id, const std::string& act_name,
+                                      int32_t layer_no, int32_t start_token, int32_t end_token,
+                                      at::Tensor slice) {
+                       dmx_host::ClickHouseRow row;
+                       row.emplace_back(model_id);
+                       row.emplace_back(req_id);
+                       row.emplace_back(act_name);
+                       row.emplace_back(layer_no);
+                       row.emplace_back(shard_rank);
+                       row.emplace_back(start_token);
+                       row.emplace_back(end_token);
+                       uint64_t nbytes = static_cast<uint64_t>(slice.nbytes());
+                       row.emplace_back(std::move(slice));
+                       host->submit_direct(std::move(row), nbytes);
+                   };
+                 } else if (py::isinstance<InMemoryRingSink>(host_engine_obj)) {
+                   auto sink = host_engine_obj.cast<std::shared_ptr<InMemoryRingSink>>();
+                   submit_fn = [sink](const std::string& model_id, int32_t shard_rank,
+                                      const std::string& req_id, const std::string& act_name,
+                                      int32_t layer_no, int32_t start_token, int32_t end_token,
+                                      at::Tensor slice) {
+                       sink->submit(model_id, shard_rank, req_id, act_name,
+                                    layer_no, start_token, end_token,
+                                    std::move(slice));
+                   };
+                 } else {
+                   throw std::invalid_argument(
+                       "RingEngine sink must be DMXHostEngine, InMemoryRingSink, or None");
+                 }
              }
              return std::make_shared<ring_py::RingEnginePy>(
                  std::move(cfg), std::move(submit_fn));
@@ -333,45 +487,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
               py::list token_ranges_py,
               py::list dim0_offsets_py,
               py::list kv_offsets_py) {
-               // Build step context (heap-allocated, ownership to FIFO/p2p)
-               auto* ctx = new ring_py::StepContext();
-               ctx->model_id  = model_id;
-               ctx->tp_rank   = tp_rank;
-               ctx->dp_rank   = dp_rank;
-               ctx->ep_rank   = ep_rank;
-               ctx->pp_rank   = pp_rank;
-               ctx->flattened = flattened;
-               ctx->requests.reserve(static_cast<size_t>(py::len(req_ids_py)));
-               for (size_t i = 0; i < static_cast<size_t>(py::len(req_ids_py)); ++i) {
-                   ring_py::RequestMeta rm;
-                   rm.req_id      = py::cast<std::string>(req_ids_py[i]);
-                   py::tuple tr   = token_ranges_py[i].cast<py::tuple>();
-                   rm.start_token = py::cast<int32_t>(tr[0]);
-                   rm.end_token   = py::cast<int32_t>(tr[1]);
-                   rm.dim0_offset = py::cast<int64_t>(dim0_offsets_py[i]);
-                   if (i < static_cast<size_t>(py::len(kv_offsets_py)))
-                       rm.kv_offset = py::cast<int32_t>(kv_offsets_py[i]);
-                   ctx->requests.push_back(std::move(rm));
-               }
-               // Build per-hook metas
-               size_t n = static_cast<size_t>(py::len(hook_types_py));
-               std::vector<ring_py::TensorMeta> metas;
-               metas.reserve(n);
-               for (size_t i = 0; i < n; ++i) {
-                   ring_py::TensorMeta meta;
-                   meta.hook_type    = py::cast<int>(hook_types_py[i]);
-                   meta.layer_no     = py::cast<int>(layer_nos_py[i]);
-                   meta.dtype        = static_cast<int>(dtypes_py[i].cast<at::ScalarType>());
-                   meta.last_in_step = (i == n - 1);
-                   meta.flags        = static_cast<uint8_t>(py::cast<int>(flags_py[i]));
-                   py::list shape    = shapes_py[i].cast<py::list>();
-                   for (auto d : shape)
-                       meta.shape.push_back(py::cast<int64_t>(d));
-                   metas.push_back(std::move(meta));
-               }
+               auto parsed = parse_step_metadata(
+                   hook_types_py, layer_nos_py, shapes_py, dtypes_py, flags_py,
+                   model_id, tp_rank, dp_rank, ep_rank, pp_rank, flattened,
+                   req_ids_py, token_ranges_py, dim0_offsets_py, kv_offsets_py);
                // Release GIL, push context + metas in single lock
                py::gil_scoped_release release;
-               self.push_step(ctx, metas);
+               self.push_step(parsed.context.release(), parsed.metas);
            },
            py::arg("hook_types"), py::arg("layer_nos"),
            py::arg("shapes"), py::arg("dtypes"), py::arg("flags"),
@@ -382,6 +504,80 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("req_ids"), py::arg("token_ranges"),
            py::arg("dim0_offsets"),
            py::arg("kv_offsets") = py::list())
+      .def("register_step_template",
+           [](ring_py::RingEnginePy& self,
+              py::list hook_types_py,
+              py::list layer_nos_py,
+              py::list shapes_py,
+              py::list dtypes_py,
+              py::list flags_py,
+              const std::string& model_id,
+              int32_t tp_rank,
+              int32_t dp_rank,
+              int32_t ep_rank,
+              int32_t pp_rank,
+              bool flattened,
+              py::list req_ids_py,
+              py::list token_ranges_py,
+              py::list dim0_offsets_py,
+              py::list kv_offsets_py) {
+             auto parsed = parse_step_metadata(
+                 hook_types_py, layer_nos_py, shapes_py, dtypes_py, flags_py,
+                 model_id, tp_rank, dp_rank, ep_rank, pp_rank, flattened,
+                 req_ids_py, token_ranges_py, dim0_offsets_py, kv_offsets_py);
+             py::gil_scoped_release release;
+             return self.register_step_template(
+                 parsed.context.release(), parsed.metas);
+           },
+           py::arg("hook_types"), py::arg("layer_nos"),
+           py::arg("shapes"), py::arg("dtypes"), py::arg("flags"),
+           py::arg("model_id"),
+           py::arg("tp_rank"), py::arg("dp_rank"),
+           py::arg("ep_rank"), py::arg("pp_rank"),
+           py::arg("flattened"),
+           py::arg("req_ids"), py::arg("token_ranges"),
+           py::arg("dim0_offsets"),
+           py::arg("kv_offsets") = py::list())
+      .def("replace_step_template",
+           [](ring_py::RingEnginePy& self,
+              uint64_t template_id,
+              py::list hook_types_py,
+              py::list layer_nos_py,
+              py::list shapes_py,
+              py::list dtypes_py,
+              py::list flags_py,
+              const std::string& model_id,
+              int32_t tp_rank,
+              int32_t dp_rank,
+              int32_t ep_rank,
+              int32_t pp_rank,
+              bool flattened,
+              py::list req_ids_py,
+              py::list token_ranges_py,
+              py::list dim0_offsets_py,
+              py::list kv_offsets_py) {
+             auto parsed = parse_step_metadata(
+                 hook_types_py, layer_nos_py, shapes_py, dtypes_py, flags_py,
+                 model_id, tp_rank, dp_rank, ep_rank, pp_rank, flattened,
+                 req_ids_py, token_ranges_py, dim0_offsets_py, kv_offsets_py);
+             py::gil_scoped_release release;
+             self.replace_step_template(
+                 template_id, parsed.context.release(), parsed.metas);
+           },
+           py::arg("template_id"),
+           py::arg("hook_types"), py::arg("layer_nos"),
+           py::arg("shapes"), py::arg("dtypes"), py::arg("flags"),
+           py::arg("model_id"),
+           py::arg("tp_rank"), py::arg("dp_rank"),
+           py::arg("ep_rank"), py::arg("pp_rank"),
+           py::arg("flattened"),
+           py::arg("req_ids"), py::arg("token_ranges"),
+           py::arg("dim0_offsets"),
+           py::arg("kv_offsets") = py::list())
+      .def("push_step_template",
+           &ring_py::RingEnginePy::push_step_template,
+           py::arg("template_id"),
+           py::call_guard<py::gil_scoped_release>())
       .def("set_null_mode",
            &ring_py::RingEnginePy::set_null_mode,
            py::arg("enabled"),

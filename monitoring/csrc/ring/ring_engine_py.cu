@@ -11,6 +11,9 @@
 #include "ring/producer.cuh"
 #include "ring/ring_debug.h"
 #include <ATen/cuda/CUDAContext.h>  // at::cuda::getCurrentCUDAStream
+#include <mutex>
+#include <stdexcept>
+#include <unordered_map>
 
 // Forward-declare symbols from producer.cu
 namespace ring {
@@ -21,9 +24,17 @@ namespace ring_py {
 
 // ---------------------------------------------------------------------------
 struct RingEnginePy::Impl {
+    struct StepTemplate {
+        StepContext context;
+        std::vector<TensorMeta> metas;
+    };
+
     TensorMetaFifo   fifo;
     ring::RingEngine engine;
     uint32_t         current_hook_idx{0};
+    std::mutex       template_mu;
+    uint64_t         next_template_id{1};
+    std::unordered_map<uint64_t, StepTemplate> step_templates;
 
     // Snapshot of the device-side actual_bytes_counter as of the last
     // prepare_step call.  Used to compute the per-step delta of bytes the
@@ -106,6 +117,43 @@ void RingEnginePy::set_null_mode(bool enabled) {
 
 void RingEnginePy::push_step(StepContext* ctx, std::vector<TensorMeta>& metas) {
     impl_->fifo.push_step(ctx, metas);
+}
+
+uint64_t RingEnginePy::register_step_template(
+    StepContext* ctx, std::vector<TensorMeta>& metas) {
+    std::unique_ptr<StepContext> owned(ctx);
+    std::lock_guard<std::mutex> lock(impl_->template_mu);
+    const uint64_t template_id = impl_->next_template_id++;
+    impl_->step_templates.emplace(
+        template_id, Impl::StepTemplate{*owned, metas});
+    return template_id;
+}
+
+void RingEnginePy::replace_step_template(
+    uint64_t template_id, StepContext* ctx,
+    std::vector<TensorMeta>& metas) {
+    std::unique_ptr<StepContext> owned(ctx);
+    std::lock_guard<std::mutex> lock(impl_->template_mu);
+    const auto it = impl_->step_templates.find(template_id);
+    if (it == impl_->step_templates.end()) {
+        throw std::invalid_argument("unknown DMI step template");
+    }
+    it->second = Impl::StepTemplate{*owned, metas};
+}
+
+void RingEnginePy::push_step_template(uint64_t template_id) {
+    auto* context = static_cast<StepContext*>(nullptr);
+    std::vector<TensorMeta> metas;
+    {
+        std::lock_guard<std::mutex> lock(impl_->template_mu);
+        const auto it = impl_->step_templates.find(template_id);
+        if (it == impl_->step_templates.end()) {
+            throw std::invalid_argument("unknown DMI step template");
+        }
+        context = new StepContext(it->second.context);
+        metas = it->second.metas;
+    }
+    impl_->fifo.push_step(context, metas);
 }
 
 // ---------------------------------------------------------------------------
@@ -323,7 +371,7 @@ void RingEnginePy::reserve_one(uint64_t nbytes) {
 void RingEnginePy::flush_and_wait() {
     cudaStream_t ms = at::cuda::getCurrentCUDAStream().stream();
     cudaStreamSynchronize(ms);
-    impl_->engine.drain_thread().force_flush_and_wait();
+    impl_->engine.flush_and_wait();
 }
 
 }  // namespace ring_py

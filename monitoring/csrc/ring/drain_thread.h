@@ -55,6 +55,13 @@ public:
     void pop_tasks(uint64_t n, std::vector<DrainTask>& out);
     void signal_p2p_stop();
 
+    // Monotonic count of tasks published to the p2p queue.  An explicit
+    // user-facing flush uses this watermark to wait until post-processing
+    // and the configured sink have consumed every drained task.
+    uint64_t p2p_submitted_count() const {
+        return p2p_submitted_count_.load(std::memory_order_acquire);
+    }
+
     void notify_staging_freed_bytes(uint64_t nbytes);
 
     bool is_running() const { return running_.load(std::memory_order_relaxed); }
@@ -111,6 +118,7 @@ private:
     std::mutex              pop_mu_;
     std::condition_variable pop_cv_;
     bool                    p2p_stop_requested_{false};
+    std::atomic<uint64_t>   p2p_submitted_count_{0};
 
     std::mutex              staging_mu_;
     std::condition_variable staging_cv_;

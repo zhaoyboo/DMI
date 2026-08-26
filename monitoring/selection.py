@@ -28,6 +28,8 @@ from .ring_transport import (
     HOOK_TYPE_TOPK_IDS,
     HOOK_TYPE_TOPK_WEIGHTS,
     HOOK_TYPE_ATTN_SUMMARY,
+    HOOK_TYPE_ATTN_SCOPE_SUMMARY,
+    HOOK_TYPE_ATTN_TOKEN_FOCUS,
     PP_FIRST_ONLY,
     PP_LAST_ONLY,
     TP_SHARDED_TYPES,
@@ -134,6 +136,10 @@ def select_hook_specs(
             unavailable.add(HOOK_TYPE_TOPK_WEIGHTS)
         if cfg.attn_summary_width == 0:
             unavailable.add(HOOK_TYPE_ATTN_SUMMARY)
+        if cfg.attn_scope_summary_width == 0:
+            unavailable.add(HOOK_TYPE_ATTN_SCOPE_SUMMARY)
+        if cfg.attn_token_focus_layers == 0 or cfg.attn_token_focus_top_k == 0:
+            unavailable.add(HOOK_TYPE_ATTN_TOKEN_FOCUS)
     return [
         spec
         for spec in specs
@@ -170,6 +176,10 @@ def apply_hook_selection(
             unavailable.add(HOOK_TYPE_TOPK_WEIGHTS)
         if cfg.attn_summary_width == 0:
             unavailable.add(HOOK_TYPE_ATTN_SUMMARY)
+        if cfg.attn_scope_summary_width == 0:
+            unavailable.add(HOOK_TYPE_ATTN_SCOPE_SUMMARY)
+        if cfg.attn_token_focus_layers == 0 or cfg.attn_token_focus_top_k == 0:
+            unavailable.add(HOOK_TYPE_ATTN_TOKEN_FOCUS)
 
     for spec in specs:
         if spec.module is None:

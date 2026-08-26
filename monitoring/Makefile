@@ -1,5 +1,6 @@
 PYTHON ?= python
 CXX ?= g++
+.DEFAULT_GOAL := all
 
 # Optional toggles
 #   LTO=1      -> enable link-time optimization (-flto)
@@ -19,6 +20,7 @@ HEADERS := csrc/dmx_host_utils.h \
            csrc/ring/ring_engine.h csrc/ring/ring_engine_py.h \
            csrc/ring/ring_torch_op.h csrc/ring/tensor_meta.h
 BUILD_DIR := build
+BUILD_FINGERPRINT := $(BUILD_DIR)/.native_toolchain_fingerprint
 OBJS := $(patsubst csrc/%.cpp,$(BUILD_DIR)/%.o,$(SRCS))
 PROJECT_ROOT := $(abspath $(CURDIR)/..)
 
@@ -116,18 +118,28 @@ RING_OBJS := $(patsubst csrc/%.cu,$(BUILD_DIR)/%.o,$(RING_SRCS))
 
 OBJS += $(RING_OBJS)
 
-.PHONY: all build clean
+.PHONY: all build clean FORCE
+
+FORCE:
 
 all: $(FINAL_TARGET)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(BUILD_DIR)/%.o: csrc/%.cpp $(HEADERS) | $(BUILD_DIR)
+$(BUILD_FINGERPRINT): FORCE | $(BUILD_DIR)
+	@current="$$($(PYTHON) -c 'import json, sys, sysconfig, torch; from torch.utils.cpp_extension import CUDA_HOME, include_paths, library_paths; print(json.dumps({"python": sys.executable, "ext_suffix": sysconfig.get_config_var("EXT_SUFFIX"), "torch": torch.__version__, "torch_cuda": torch.version.cuda, "torch_abi": int(torch._C._GLIBCXX_USE_CXX11_ABI), "cuda_home": CUDA_HOME, "include_paths": include_paths(), "library_paths": library_paths()}, sort_keys=True))')|SM_ARCH=$(SM_ARCH)|CXX=$$($(CXX) --version | head -n 1)|NVCC=$$($(NVCC) --version | tail -n 1)"; \
+	old="$$(test -f $@ && cat $@ || true)"; \
+	if test "$$current" != "$$old"; then \
+	  rm -f $(OBJS) $(BUILD_DIR)/$(TARGET_SO); \
+	  printf '%s\n' "$$current" > $@; \
+	fi
+
+$(BUILD_DIR)/%.o: csrc/%.cpp $(HEADERS) $(BUILD_FINGERPRINT) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/ring/%.o: csrc/ring/%.cu | $(BUILD_DIR)
+$(BUILD_DIR)/ring/%.o: csrc/ring/%.cu $(BUILD_FINGERPRINT) | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) -MMD -MP -MF $(@:.o=.d) -c $< -o $@
 

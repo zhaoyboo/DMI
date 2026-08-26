@@ -11,8 +11,11 @@
 #include "ring_config.h"
 #include "tensor_meta.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -44,6 +47,11 @@ public:
     void start();
     void stop();
 
+    // Wait until all tasks up to the drain-provided watermark have completed
+    // post-processing and sink submission.  Ordinary capacity flushes do not
+    // call this because they only need ring space reclaimed.
+    void wait_until_processed(uint64_t target);
+
 private:
     DrainThread&             drain_;
     ring_py::TensorMetaFifo& fifo_;
@@ -52,10 +60,14 @@ private:
 
     std::thread              thread_;
     ring_py::StepContext*    current_ctx_{nullptr};  // owned, freed on last_in_step
+    std::atomic<uint64_t>    processed_count_{0};
+    std::mutex               processed_mu_;
+    std::condition_variable  processed_cv_;
 
     void loop();
     void process(std::vector<DrainTask>& tasks);
     void do_post_processing(at::Tensor& tensor, const DrainTask& first_task);
+    void mark_processed();
 };
 
 }  // namespace ring

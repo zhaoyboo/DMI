@@ -64,7 +64,10 @@ GROUP_ATTN, GROUP_MLP, GROUP_OTHER = 0, 1, 2
 SHAPE_HIDDEN, SHAPE_QKV_Q, SHAPE_QKV_KV, SHAPE_QKV_Z = 0, 1, 2, 3
 SHAPE_ATTN_WT, SHAPE_MLP_POST, SHAPE_TOKEN_IDS, SHAPE_LOGITS = 4, 5, 6, 7
 SHAPE_ATTN_SUMMARY = 11
+SHAPE_ATTN_SCOPE_SUMMARY = 12
+SHAPE_ATTN_TOKEN_FOCUS = 13
 PP_ANY, PP_FIRST, PP_LAST = 0, 1, 2
+_ATTNSKETCH_ENCODING_CACHE_MAX = 128
 
 
 class HookRowBasis(Enum):
@@ -123,15 +126,20 @@ def hook_row_basis(hook_type: int) -> HookRowBasis:
     """Return the canonical row basis derived from `_HOOK_DEFS.shape_class`.
 
     The native hook-definition table is the sole mapping source. Logit-shaped
-    payloads are request-scaled; every other registered shape class is
-    token-scaled. An unregistered hook type is a configuration error.
+    and request-scope summary payloads are request-scaled; every other
+    registered shape class is token-scaled. An unregistered hook type is a
+    configuration error.
     """
 
     try:
         shape_class = _shape_class_by_type[hook_type]
     except KeyError as exc:
         raise ValueError(f"Unknown hook type: {hook_type!r}") from exc
-    if shape_class == SHAPE_LOGITS:
+    if shape_class in (
+        SHAPE_LOGITS,
+        SHAPE_ATTN_SCOPE_SUMMARY,
+        SHAPE_ATTN_TOKEN_FOCUS,
+    ):
         return HookRowBasis.REQUEST_ROWS
     return HookRowBasis.TOKEN_ROWS
 
@@ -190,6 +198,14 @@ class ModelShapeConfig:
     num_experts:  int = 0  # router_logits final dim
     top_k:        int = 0  # topk_ids / topk_weights final dim
     attn_summary_width: int = 0  # exact AttnSketch scalars per query/head
+    # Exact request-scoped vector after any declared layer/head reduction.
+    # Unlike attn_summary_width, this axis has no per-head dimension.
+    attn_scope_summary_width: int = 0
+    # Exact compact token-focus record emitted once per request step.  The
+    # payload shape is [request, layer, local_head, 2*K+2], with interleaved
+    # (token_id, probability) fields followed by coverage and tail mass.
+    attn_token_focus_layers: int = 0
+    attn_token_focus_top_k: int = 0
     tp_size:      int = 1  # tensor parallel world size
     tp_rank:      int = 0  # this rank's TP index
 
@@ -365,6 +381,22 @@ def _compute_hook_shape(
         if cfg.attn_summary_width < 1:
             return []
         return b + [q_len, cfg.num_heads // tp, cfg.attn_summary_width]
+    if hook_type == HOOK_TYPE_ATTN_SCOPE_SUMMARY:
+        if cfg.attn_scope_summary_width < 1:
+            return []
+        request_rows = batch if batch > 0 else logits_to_keep
+        if request_rows < 1:
+            return []
+        return [request_rows, cfg.attn_scope_summary_width]
+    if hook_type == HOOK_TYPE_ATTN_TOKEN_FOCUS:
+        if cfg.attn_token_focus_layers < 1 or cfg.attn_token_focus_top_k < 1:
+            return []
+        request_rows = batch if batch > 0 else logits_to_keep
+        if request_rows < 1:
+            return []
+        local_heads = cfg.num_heads // tp
+        fields = 2 * cfg.attn_token_focus_top_k + 2
+        return [request_rows, cfg.attn_token_focus_layers, local_heads, fields]
     if hook_type == HOOK_TYPE_MLP_POST:
         if cfg.intermediate_dim == 0:
             return []  # intermediate_dim unknown -- skip this hook
@@ -456,6 +488,12 @@ class RingTransport:
         self._current_token_ranges: Optional[List[Tuple[int, int]]] = None
         self._current_dim0_offsets: Optional[List[int]] = None
         self._current_kv_offsets: Optional[List[int]] = None
+        # Graph replay validates immutable request/page epochs on every step.
+        # Cache only the canonical encoding of the *expected* tuple; current
+        # request IDs remain dynamic and are compared each replay.
+        self._attnsketch_expected_encoding_cache: dict[
+            tuple[tuple[str, int, int], ...], tuple[str, ...]
+        ] = {}
 
         # When True: meta pushes are skipped so the FIFO stays empty.
         # Producer kernel still fires (for CUDA graph capture) but as no-ops.
@@ -566,6 +604,17 @@ class RingTransport:
         dtypes = []
         flags = []
         for spec in self._active_specs:
+            if spec.hook_type in (
+                HOOK_TYPE_ATTN_SCOPE_SUMMARY,
+                HOOK_TYPE_ATTN_TOKEN_FOCUS,
+            ):
+                request_rows = batch if batch > 0 else logits_to_keep
+                if request_rows != len(self._current_req_ids):
+                    raise ValueError(
+                        "AttnSketch request-row mismatch for request-scoped record: "
+                        f"shape implies {request_rows}, context has "
+                        f"{len(self._current_req_ids)} requests"
+                    )
             spec_q_len = (actual_q_len if actual_q_len is not None
                           and spec.dim0_is_actual_tokens
                           else q_len)
@@ -602,6 +651,147 @@ class RingTransport:
                 list(self._current_kv_offsets) if self._current_kv_offsets else [],
             )
 
+    def pre_push_attnsketch_bound_scope_metas(
+        self,
+        *,
+        capture_id: str,
+        expected_requests: tuple[tuple[str, int, int], ...],
+        batch: int,
+        q_len: int,
+        kv_dim: int,
+        logits_to_keep: int = 0,
+    ) -> None:
+        """Validate AttnSketch attribution and push its DMI metadata once.
+
+        This is the graph-replay control path.  Combining the two operations
+        avoids inserting an extra Python dispatch gap between the timing event
+        and a very short single-layer CUDA graph while preserving per-replay
+        request/page-epoch validation.
+        """
+
+        self.validate_attnsketch_bound_scope(
+            capture_id=capture_id,
+            expected_requests=expected_requests,
+        )
+        self.pre_push_all_metas(
+            batch=batch,
+            q_len=q_len,
+            kv_dim=kv_dim,
+            logits_to_keep=logits_to_keep,
+        )
+
+    def pre_push_attnsketch_bound_token_focus_metas(
+        self,
+        *,
+        capture_id: str,
+        expected_requests: tuple[tuple[str, int, int], ...],
+        batch: int,
+        q_len: int,
+        kv_dim: int,
+        logits_to_keep: int = 0,
+    ) -> None:
+        """Validate attribution before queuing exact token-focus metadata."""
+
+        self.validate_attnsketch_bound_scope(
+            capture_id=capture_id,
+            expected_requests=expected_requests,
+        )
+        self.pre_push_all_metas(
+            batch=batch,
+            q_len=q_len,
+            kv_dim=kv_dim,
+            logits_to_keep=logits_to_keep,
+        )
+
+    def register_attnsketch_bound_scope_meta_template(
+        self,
+        *,
+        capture_id: str,
+        expected_requests: tuple[tuple[str, int, int], ...],
+        batch: int,
+        q_len: int,
+        kv_dim: int,
+        logits_to_keep: int = 0,
+    ) -> "AttnSketchBoundScopeMetaTemplate":
+        """Precompile one immutable AttnSketch DMI metadata record.
+
+        The fast path is intentionally narrow: exactly one request-scoped
+        summary hook, fixed request ordering, fixed token ranges, and fixed
+        rank/layout context. Any drift fails before the cached metadata is
+        pushed. Other DMI hook mixtures continue to use ``pre_push_all_metas``.
+        """
+
+        self.validate_attnsketch_bound_scope(
+            capture_id=capture_id,
+            expected_requests=expected_requests,
+        )
+        cfg = self._model_cfg
+        if cfg is None:
+            raise RuntimeError("AttnSketch metadata template requires model shape")
+        specs = tuple(self._active_specs)
+        if len(specs) != 1 or specs[0].hook_type != HOOK_TYPE_ATTN_SCOPE_SUMMARY:
+            raise ValueError(
+                "cached AttnSketch metadata requires one scope-summary hook"
+            )
+        requests = self._current_req_ids
+        token_ranges = self._current_token_ranges
+        dim0_offsets = self._current_dim0_offsets
+        if requests is None or token_ranges is None or dim0_offsets is None:
+            raise RuntimeError("AttnSketch metadata template requires step context")
+        request_rows = batch if batch > 0 else logits_to_keep
+        if request_rows != len(requests):
+            raise ValueError("AttnSketch metadata template request-row mismatch")
+        shape = _compute_hook_shape(
+            HOOK_TYPE_ATTN_SCOPE_SUMMARY,
+            cfg,
+            batch,
+            q_len,
+            kv_dim,
+            logits_to_keep=logits_to_keep,
+        )
+        if not shape:
+            raise ValueError("AttnSketch metadata template has an empty shape")
+        dtype = specs[0].dtype if specs[0].dtype is not None else cfg.dtype
+        kv_offsets = self._current_kv_offsets or []
+        template_id = self._ring_engine.register_step_template(
+            [HOOK_TYPE_ATTN_SCOPE_SUMMARY],
+            [specs[0].layer_no],
+            [shape],
+            [dtype],
+            [1 if specs[0].allow_token_cnt_mismatch else 0],
+            self._current_model_id,
+            self._current_tp_rank,
+            self._current_dp_rank,
+            self._current_ep_rank,
+            self._current_pp_rank,
+            self._current_flattened,
+            requests,
+            token_ranges,
+            dim0_offsets,
+            kv_offsets,
+        )
+        return AttnSketchBoundScopeMetaTemplate(
+            transport=self,
+            template_id=template_id,
+            capture_id=capture_id,
+            expected_requests=expected_requests,
+            expected_req_ids=tuple(requests),
+            expected_token_ranges=tuple(token_ranges),
+            expected_dim0_offsets=tuple(dim0_offsets),
+            expected_kv_offsets=tuple(kv_offsets),
+            expected_rank_layout=(
+                self._current_tp_rank,
+                self._current_dp_rank,
+                self._current_ep_rank,
+                self._current_pp_rank,
+                self._current_flattened,
+            ),
+            expected_spec=specs[0],
+            expected_model_cfg=cfg,
+            expected_shape=tuple(shape),
+            expected_dtype=dtype,
+        )
+
     def submit_cpu_direct(self, cpu_tensor: torch.Tensor,
                           hook_type: int, hook_id: int) -> None:
         """Submit a CPU-tensor to the drain -> p2p pipeline.
@@ -611,6 +801,309 @@ class RingTransport:
         CPU memory; it bypasses the ring and staging entirely.
         """
         self._ring_engine.submit_cpu_direct(cpu_tensor)
+
+    def submit_attnsketch_scope_summary(self, tensor: torch.Tensor) -> None:
+        """Publish one preallocated request-scoped AttnSketch vector.
+
+        Step metadata and ring capacity must already have been prepared by the
+        normal adapter path.  This method deliberately rejects implicit
+        ``contiguous()`` or dtype conversion: either would add unbudgeted work
+        between the observer reducer and DMI.  The stable tensor and payload
+        pointers make the call suitable for fixed-topology CUDA graph capture.
+        """
+
+        cfg = self._model_cfg
+        requests = self._current_req_ids
+        if cfg is None or cfg.attn_scope_summary_width < 1:
+            raise RuntimeError("AttnSketch scope-summary shape is not configured")
+        if requests is None or not requests:
+            raise RuntimeError("AttnSketch scope-summary request context is missing")
+        if not any(
+            spec.hook_type == HOOK_TYPE_ATTN_SCOPE_SUMMARY
+            for spec in self._active_specs
+        ):
+            raise RuntimeError("AttnSketch scope-summary hook is not active")
+        expected = (len(requests), cfg.attn_scope_summary_width)
+        if tuple(tensor.shape) != expected:
+            raise ValueError(
+                f"AttnSketch scope summary must have shape {expected}, "
+                f"got {tuple(tensor.shape)}"
+            )
+        if (
+            not tensor.is_cuda
+            or tensor.dtype != torch.float32
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError("AttnSketch scope summary must be contiguous CUDA FP32")
+        if tensor.device != self._ring_payload.device:
+            raise ValueError("AttnSketch scope summary and DMI ring must share a device")
+        torch.ops.ring.producer(
+            self._ring_payload,
+            tensor,
+            HOOK_TYPE_ATTN_SCOPE_SUMMARY,
+            -1,
+        )
+
+    def submit_attnsketch_token_focus(self, tensor: torch.Tensor) -> None:
+        """Publish one exact compact token-focus tensor without conversion.
+
+        The native record has shape ``[request, layer, local_head, 2*K+2]``.
+        Each rank stores interleaved FP32 ``(token_id, probability)`` pairs,
+        followed by exact Top-K coverage and its unresolved tail mass.  The
+        method deliberately accepts no generic summary width: changing K,
+        layer count, TP geometry, dtype, contiguity, or device is an ABI error.
+        """
+
+        cfg = self._model_cfg
+        requests = self._current_req_ids
+        if (
+            cfg is None
+            or cfg.attn_token_focus_layers < 1
+            or cfg.attn_token_focus_top_k < 1
+        ):
+            raise RuntimeError("AttnSketch token-focus shape is not configured")
+        if requests is None or not requests:
+            raise RuntimeError("AttnSketch token-focus request context is missing")
+        if not any(
+            spec.hook_type == HOOK_TYPE_ATTN_TOKEN_FOCUS
+            for spec in self._active_specs
+        ):
+            raise RuntimeError("AttnSketch token-focus hook is not active")
+        expected = (
+            len(requests),
+            cfg.attn_token_focus_layers,
+            cfg.num_heads // cfg.tp_size,
+            2 * cfg.attn_token_focus_top_k + 2,
+        )
+        if tuple(tensor.shape) != expected:
+            raise ValueError(
+                f"AttnSketch token focus must have shape {expected}, "
+                f"got {tuple(tensor.shape)}"
+            )
+        if (
+            not tensor.is_cuda
+            or tensor.dtype != torch.float32
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError("AttnSketch token focus must be contiguous CUDA FP32")
+        if tensor.device != self._ring_payload.device:
+            raise ValueError("AttnSketch token focus and DMI ring must share a device")
+        torch.ops.ring.producer(
+            self._ring_payload,
+            tensor,
+            HOOK_TYPE_ATTN_TOKEN_FOCUS,
+            -1,
+        )
+
+    def submit_attnsketch_bound_token_focus(
+        self,
+        tensor: torch.Tensor,
+        *,
+        capture_id: str,
+        expected_requests: tuple[tuple[str, int, int], ...],
+    ) -> None:
+        """Publish exact token focus only under matching capture/epochs."""
+
+        self.validate_attnsketch_bound_scope(
+            capture_id=capture_id,
+            expected_requests=expected_requests,
+        )
+        self.submit_attnsketch_token_focus(tensor)
+
+    def submit_attnsketch_bound_scope_summary(
+        self,
+        tensor: torch.Tensor,
+        *,
+        capture_id: str,
+        expected_requests: tuple[tuple[str, int, int], ...],
+    ) -> None:
+        """Publish a scope vector only under matching immutable provenance.
+
+        ``expected_requests`` entries are ``(raw request_id,
+        request_table_epoch, page_table_epoch)``.  The active DMI context must
+        carry the corresponding encoded AttnSketch request identifiers and
+        the exact capture digest.  This keeps the GPU payload metric-only
+        while making a stale allocator epoch or ordinary model/request label a
+        hard pre-submit error.
+        """
+
+        self.validate_attnsketch_bound_scope(
+            capture_id=capture_id,
+            expected_requests=expected_requests,
+        )
+        self.submit_attnsketch_scope_summary(tensor)
+
+    def validate_attnsketch_bound_scope(
+        self,
+        *,
+        capture_id: str,
+        expected_requests: tuple[tuple[str, int, int], ...],
+    ) -> None:
+        """Validate dynamic request/page epochs without launching a producer.
+
+        CUDA Graph capture executes ``submit_attnsketch_bound_scope_summary``
+        only once.  Replays therefore call this control-plane method before
+        the captured ring producer so stale request or allocator epochs still
+        fail closed on every step.
+        """
+
+        from .attnsketch_pipeline import AttnSketchRequestBinding
+
+        if not capture_id.startswith("attnsketch:v1:"):
+            raise ValueError("AttnSketch capture_id is malformed")
+        if self._current_model_id != capture_id:
+            raise ValueError("active DMI model_id does not match AttnSketch capture")
+        observed_requests = self._current_req_ids
+        if observed_requests is None or len(observed_requests) != len(
+            expected_requests
+        ):
+            raise ValueError("active DMI request rows do not match AttnSketch scope")
+        cache = getattr(self, "_attnsketch_expected_encoding_cache", None)
+        if cache is None:
+            # Supports lightweight tests that construct RingTransport via
+            # ``__new__`` without bypassing validation.
+            cache = {}
+            self._attnsketch_expected_encoding_cache = cache
+        required_ids = cache.get(expected_requests)
+        if required_ids is None:
+            required_ids = tuple(
+                AttnSketchRequestBinding(*expected).encode()
+                for expected in expected_requests
+            )
+            if len(cache) >= _ATTNSKETCH_ENCODING_CACHE_MAX:
+                # Request churn otherwise turns this replay optimization into
+                # an unbounded process-lifetime allocation. Recomputing an
+                # evicted tuple is a low-frequency control-plane cost.
+                cache.clear()
+            cache[expected_requests] = required_ids
+        if tuple(observed_requests) != required_ids:
+            raise ValueError("active DMI request/page epochs do not match scope")
+
+
+@dataclass
+class AttnSketchBoundScopeMetaTemplate:
+    """Fail-closed native metadata template for a fixed tensor topology.
+
+    The CUDA Graph owns only the GPU producer operation.  Request IDs and
+    token/page attribution live in the host/native metadata FIFO and may be
+    rebound atomically without recapturing that Graph, provided the tensor
+    shape, hook, model, rank layout, and capture provenance remain unchanged.
+    """
+
+    transport: RingTransport
+    template_id: int
+    capture_id: str
+    expected_requests: tuple[tuple[str, int, int], ...]
+    expected_req_ids: tuple[str, ...]
+    expected_token_ranges: tuple[tuple[int, int], ...]
+    expected_dim0_offsets: tuple[int, ...]
+    expected_kv_offsets: tuple[int, ...]
+    expected_rank_layout: tuple[int, int, int, int, bool]
+    expected_spec: HookSpec
+    expected_model_cfg: ModelShapeConfig
+    expected_shape: tuple[int, ...]
+    expected_dtype: torch.dtype
+
+    def rebind(
+        self,
+        *,
+        expected_requests: tuple[tuple[str, int, int], ...],
+    ) -> None:
+        """Atomically replace dynamic request attribution for later pushes.
+
+        Scheduler-level rollback/ABA checks happen before this method.  This
+        transport boundary independently verifies that the current encoded
+        request IDs match ``expected_requests`` and that no fixed-topology
+        field drifted.  The native template is replaced under the same mutex
+        used by ``push_step_template``; a push observes either the old record
+        or the complete new record, never a partially rewritten one.
+        """
+
+        transport = self.transport
+        transport.validate_attnsketch_bound_scope(
+            capture_id=self.capture_id,
+            expected_requests=expected_requests,
+        )
+        requests = tuple(transport._current_req_ids or ())
+        token_ranges = tuple(transport._current_token_ranges or ())
+        dim0_offsets = tuple(transport._current_dim0_offsets or ())
+        kv_offsets = tuple(transport._current_kv_offsets or ())
+        if len(requests) != len(self.expected_req_ids):
+            raise ValueError("cached DMI request-row topology changed")
+        if not (
+            len(token_ranges) == len(requests)
+            and len(dim0_offsets) == len(requests)
+            and len(kv_offsets) in (0, len(requests))
+        ):
+            raise ValueError("cached DMI request metadata is incomplete")
+        current_rank_layout = (
+            transport._current_tp_rank,
+            transport._current_dp_rank,
+            transport._current_ep_rank,
+            transport._current_pp_rank,
+            transport._current_flattened,
+        )
+        if current_rank_layout != self.expected_rank_layout:
+            raise ValueError("cached DMI rank/layout topology changed")
+        if transport._model_cfg != self.expected_model_cfg:
+            raise ValueError("cached DMI model shape changed")
+        if tuple(transport._active_specs) != (self.expected_spec,):
+            raise ValueError("cached DMI hook selection changed")
+
+        transport._ring_engine.replace_step_template(
+            self.template_id,
+            [HOOK_TYPE_ATTN_SCOPE_SUMMARY],
+            [self.expected_spec.layer_no],
+            [list(self.expected_shape)],
+            [self.expected_dtype],
+            [1 if self.expected_spec.allow_token_cnt_mismatch else 0],
+            transport._current_model_id,
+            transport._current_tp_rank,
+            transport._current_dp_rank,
+            transport._current_ep_rank,
+            transport._current_pp_rank,
+            transport._current_flattened,
+            list(requests),
+            list(token_ranges),
+            list(dim0_offsets),
+            list(kv_offsets),
+        )
+        self.expected_requests = expected_requests
+        self.expected_req_ids = requests
+        self.expected_token_ranges = token_ranges
+        self.expected_dim0_offsets = dim0_offsets
+        self.expected_kv_offsets = kv_offsets
+
+    def push(self) -> None:
+        """Validate all dynamic context, then clone the native template."""
+
+        transport = self.transport
+        transport.validate_attnsketch_bound_scope(
+            capture_id=self.capture_id,
+            expected_requests=self.expected_requests,
+        )
+        if tuple(transport._current_req_ids or ()) != self.expected_req_ids:
+            raise ValueError("cached DMI request ordering changed")
+        if tuple(transport._current_token_ranges or ()) != self.expected_token_ranges:
+            raise ValueError("cached DMI token ranges changed")
+        if tuple(transport._current_dim0_offsets or ()) != self.expected_dim0_offsets:
+            raise ValueError("cached DMI row offsets changed")
+        if tuple(transport._current_kv_offsets or ()) != self.expected_kv_offsets:
+            raise ValueError("cached DMI KV offsets changed")
+        current_rank_layout = (
+            transport._current_tp_rank,
+            transport._current_dp_rank,
+            transport._current_ep_rank,
+            transport._current_pp_rank,
+            transport._current_flattened,
+        )
+        if current_rank_layout != self.expected_rank_layout:
+            raise ValueError("cached DMI rank/layout context changed")
+        if transport._model_cfg != self.expected_model_cfg:
+            raise ValueError("cached DMI model shape changed")
+        if tuple(transport._active_specs) != (self.expected_spec,):
+            raise ValueError("cached DMI hook selection changed")
+        transport._ring_engine.push_step_template(self.template_id)
 
 
 

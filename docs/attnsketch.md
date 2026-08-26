@@ -24,9 +24,64 @@ Unknown captures, malformed IDs, changed semantics, and stale allocator epochs
 fail closed. This binding uses DMI's existing per-record string metadata, so it
 does not repeat large fingerprints in every query/head payload.
 
+Page/superpage mass tensors additionally register an
+`AttnSketchPageMapping`. `AttnSketchPageMapping.from_export_fields()` consumes
+the sidecar emitted by `SelectedTileMassBatch.bind_page_table()`, recomputes
+its digest, and rejects tampered physical IDs. Consumers resolve that digest
+through `AttnSketchPageMappingRegistry` and call
+`validate_attnsketch_page_mapping_identity`; a changed request slot,
+request-table epoch, or page-table epoch is a hard error. The large mapping is
+stored once as sidecar metadata rather than repeated in every layer/head
+payload.
+
 This branch does not yet install a FlashAttention model adapter that fires the
 hook. That adapter belongs to AttnSketch-lib and must be pinned to a validated
 kernel manifest.
+
+## Request-scoped layer/head aggregates
+
+AttnSketch may apply a declared linear reduction across all selected layers
+and heads on the GPU before transport. That output has a different semantic
+axis and uses a separate hook:
+
+```text
+activation name: attn.attnsketch_scope_summary
+short name:      attn_scope_summary
+shape:           [requests, scope_summary_width]
+```
+
+Set `ModelShapeConfig.attn_scope_summary_width` and activate the hook
+explicitly. `RingTransport.submit_attnsketch_scope_summary()` accepts only a
+preallocated contiguous CUDA FP32 tensor on the ring device. It rejects an
+inactive hook, missing request context, implicit dtype/layout conversion, and
+any mismatch between the number of tensor rows and request records. Packed
+and batched drain paths both slice this tensor by request position rather than
+by scheduled-token offsets.
+
+The low-level method above remains useful for isolated transport benchmarks.
+Production AttnSketch adapters use
+`submit_attnsketch_bound_scope_summary()`: it additionally requires the exact
+capture ID plus `(raw request ID, request-table epoch, page-table epoch)` for
+every row, decodes the active DMI request bindings, and rejects the tensor
+before ring publication if any identity differs. The public batch adapter also
+returns one `BoundPageMassSummary` per request so the physical-page mapping can
+be registered and validated by the consumer.
+
+The canonical 32-layer/8-head decode experiment reduces 256 semantic rows to
+one 128-entry (512 B) vector, then traverses the real GPU ring and asynchronous
+D2H drain. It is a raw `SUM`; consumers divide by the declared normalization
+denominator only when they need a probability distribution. The hook never
+silently substitutes the per-layer/per-head `attn_summary` semantics.
+
+A separate batch-safe producer/reducer has also traversed this hook with
+1/4/8 request rows. A 200-pair admission sweep accepts 8/16/32-layer groups
+only when both paired p50 and p99 overhead are below 5%; shorter groups fail
+closed. At eight requests and 32 modeled layers it publishes 4 KiB instead of
+1 MiB of separate layer/head vectors, while retaining distinct request rows
+and bitwise O/LSE identity against an unmodified pinned FA2 control. This
+validates request-row, capture, and allocator-epoch transport contracts; the
+CUDA producer still uses contiguous fixed-length KV and therefore is not yet
+a paged-attention serving result.
 
 The transport is metric-agnostic. The pinned positional adapter uses width 2
 with metrics `("argmax_logical_token_f32", "p_max")`. Its token index is

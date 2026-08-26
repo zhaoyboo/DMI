@@ -24,8 +24,10 @@ from typing import Iterable, Mapping
 
 
 ATTSKETCH_PROVENANCE_SCHEMA_VERSION = 1
+ATTSKETCH_TOKEN_FOCUS_SCHEMA_VERSION = 1
 _CAPTURE_PREFIX = "attnsketch:v1:"
 _REQUEST_PREFIX = "as1."
+_PAGE_MAPPING_PREFIX = "sha256:"
 
 
 def _require_digest(value: str, name: str) -> None:
@@ -79,6 +81,76 @@ class AttnSketchCaptureProvenance:
 
 
 @dataclass(frozen=True)
+class AttnSketchTokenFocusSchema:
+    """Versioned exact compact token-focus payload contract.
+
+    The payload is a contiguous FP32 tensor with shape
+    ``[requests, layers, local_heads, 2*K+2]``.  Token IDs are represented as
+    exactly integral FP32 values, interleaved with probabilities; coverage and
+    tail mass occupy the last two fields.  Binary provenance remains in the
+    capture manifest rather than being repeated in every GPU record.
+    """
+
+    top_k: int
+    layers: int
+    local_heads: int
+    schema_version: int = ATTSKETCH_TOKEN_FOCUS_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != ATTSKETCH_TOKEN_FOCUS_SCHEMA_VERSION:
+            raise ValueError("unsupported AttnSketch token-focus schema version")
+        if min(self.top_k, self.layers, self.local_heads) < 1:
+            raise ValueError("token-focus K, layers, and local heads must be positive")
+
+    @property
+    def fields(self) -> tuple[str, ...]:
+        ranked = tuple(
+            name
+            for rank in range(self.top_k)
+            for name in (f"token_id_{rank}", f"probability_{rank}")
+        )
+        return ranked + ("coverage", "tail_mass")
+
+    @property
+    def width(self) -> int:
+        return 2 * self.top_k + 2
+
+    def expected_shape(self, requests: int) -> tuple[int, int, int, int]:
+        if requests < 1:
+            raise ValueError("token-focus request count must be positive")
+        return (requests, self.layers, self.local_heads, self.width)
+
+    @property
+    def contract_hash(self) -> str:
+        document = {
+            "observable": "exact_token_topk_focus",
+            "schema_version": self.schema_version,
+            "top_k": self.top_k,
+            "layers": self.layers,
+            "local_heads": self.local_heads,
+            "dtype": "float32",
+            "fields": self.fields,
+            "ordering": "probability_desc_token_id_asc",
+        }
+        encoded = json.dumps(
+            document, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def validate_attnsketch_token_focus_provenance(
+    provenance: AttnSketchCaptureProvenance,
+    schema: AttnSketchTokenFocusSchema,
+) -> None:
+    """Reject a capture whose declared metrics are not this exact schema."""
+
+    if provenance.metrics != schema.fields:
+        raise ValueError("capture metrics do not match token-focus field ordering")
+    if provenance.query_contract_hash != schema.contract_hash:
+        raise ValueError("capture query contract does not match token-focus schema")
+
+
+@dataclass(frozen=True)
 class AttnSketchRequestBinding:
     """Request identity plus allocator epochs required for safe attribution."""
 
@@ -119,6 +191,209 @@ class AttnSketchRequestBinding:
         except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
             raise ValueError("invalid AttnSketch request identifier") from exc
         return cls(raw_id, request_epoch, page_epoch)
+
+
+@dataclass(frozen=True)
+class AttnSketchPageGroup:
+    """One exported mass cell and the physical pages it represents."""
+
+    telemetry_index: int
+    key_start: int
+    key_end: int
+    logical_pages: tuple[int, ...]
+    physical_pages: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if self.telemetry_index < 0 or self.key_start < 0:
+            raise ValueError("page-group indices and key offsets must be non-negative")
+        if self.key_end <= self.key_start:
+            raise ValueError("page-group key range must be nonempty")
+        if not self.logical_pages or len(self.logical_pages) != len(
+            self.physical_pages
+        ):
+            raise ValueError("page groups require matched logical/physical pages")
+        if tuple(sorted(set(self.logical_pages))) != self.logical_pages:
+            raise ValueError("logical page IDs must be sorted and unique")
+        if any(page < 0 for page in self.logical_pages + self.physical_pages):
+            raise ValueError("page IDs must be non-negative")
+
+
+@dataclass(frozen=True)
+class AttnSketchPageMapping:
+    """Immutable sidecar mapping for a page/superpage mass tensor."""
+
+    request_id: str
+    request_slot: int
+    request_table_epoch: int
+    page_table_epoch: int
+    runtime_page_tokens: int
+    telemetry_page_tokens: int
+    valid_tokens: int
+    groups: tuple[AttnSketchPageGroup, ...]
+
+    def __post_init__(self) -> None:
+        if not self.request_id:
+            raise ValueError("request_id must not be empty")
+        if min(
+            self.request_slot,
+            self.request_table_epoch,
+            self.page_table_epoch,
+        ) < 0:
+            raise ValueError("request slots and epochs must be non-negative")
+        if min(
+            self.runtime_page_tokens,
+            self.telemetry_page_tokens,
+            self.valid_tokens,
+        ) < 1:
+            raise ValueError("page and valid-token sizes must be positive")
+        if not self.groups:
+            raise ValueError("page mapping must contain at least one group")
+        if self.groups[0].key_start != 0 or self.groups[-1].key_end != self.valid_tokens:
+            raise ValueError("page mapping must cover the complete valid key range")
+        for index, group in enumerate(self.groups):
+            if group.telemetry_index != index:
+                raise ValueError("page-group indices must be contiguous")
+            if index and self.groups[index - 1].key_end != group.key_start:
+                raise ValueError("page groups must be contiguous")
+
+    def canonical_bytes(self) -> bytes:
+        document = {
+            "request_id": self.request_id,
+            "request_slot": self.request_slot,
+            "request_table_epoch": self.request_table_epoch,
+            "page_table_epoch": self.page_table_epoch,
+            "runtime_page_tokens": self.runtime_page_tokens,
+            "telemetry_page_tokens": self.telemetry_page_tokens,
+            "valid_tokens": self.valid_tokens,
+            "groups": [
+                {
+                    "telemetry_index": group.telemetry_index,
+                    "key_start": group.key_start,
+                    "key_end": group.key_end,
+                    "logical_pages": list(group.logical_pages),
+                    "physical_pages": list(group.physical_pages),
+                }
+                for group in self.groups
+            ],
+        }
+        return json.dumps(
+            document, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+
+    @property
+    def mapping_hash(self) -> str:
+        return _PAGE_MAPPING_PREFIX + hashlib.sha256(self.canonical_bytes()).hexdigest()
+
+    @classmethod
+    def from_export_fields(
+        cls, fields: Mapping[str, object]
+    ) -> "AttnSketchPageMapping":
+        required = {
+            "request_id",
+            "request_slot",
+            "request_table_epoch",
+            "page_table_epoch",
+            "runtime_page_tokens",
+            "telemetry_page_tokens",
+            "valid_tokens",
+            "physical_page_groups",
+            "page_mapping_hash",
+        }
+        missing = required.difference(fields)
+        if missing:
+            raise ValueError(f"page export fields are missing {sorted(missing)}")
+        physical_groups = fields["physical_page_groups"]
+        if not isinstance(physical_groups, list):
+            raise ValueError("physical_page_groups must be a list")
+        runtime_page_tokens = int(fields["runtime_page_tokens"])
+        telemetry_page_tokens = int(fields["telemetry_page_tokens"])
+        valid_tokens = int(fields["valid_tokens"])
+        groups: list[AttnSketchPageGroup] = []
+        for index, physical_pages_value in enumerate(physical_groups):
+            if not isinstance(physical_pages_value, list):
+                raise ValueError("each physical page group must be a list")
+            key_start = index * telemetry_page_tokens
+            key_end = min(valid_tokens, key_start + telemetry_page_tokens)
+            logical_start = key_start // runtime_page_tokens
+            logical_end = (key_end + runtime_page_tokens - 1) // runtime_page_tokens
+            groups.append(
+                AttnSketchPageGroup(
+                    telemetry_index=index,
+                    key_start=key_start,
+                    key_end=key_end,
+                    logical_pages=tuple(range(logical_start, logical_end)),
+                    physical_pages=tuple(int(page) for page in physical_pages_value),
+                )
+            )
+        mapping = cls(
+            request_id=str(fields["request_id"]),
+            request_slot=int(fields["request_slot"]),
+            request_table_epoch=int(fields["request_table_epoch"]),
+            page_table_epoch=int(fields["page_table_epoch"]),
+            runtime_page_tokens=runtime_page_tokens,
+            telemetry_page_tokens=telemetry_page_tokens,
+            valid_tokens=valid_tokens,
+            groups=tuple(groups),
+        )
+        if mapping.mapping_hash != fields["page_mapping_hash"]:
+            raise ValueError("page mapping hash does not match export fields")
+        return mapping
+
+
+class AttnSketchPageMappingRegistry:
+    """Digest-indexed sidecar registry for allocator-sensitive page mappings."""
+
+    def __init__(self, entries: Iterable[AttnSketchPageMapping] = ()) -> None:
+        self._entries: dict[str, AttnSketchPageMapping] = {}
+        for entry in entries:
+            self.register(entry)
+
+    def register(self, mapping: AttnSketchPageMapping) -> str:
+        mapping_hash = mapping.mapping_hash
+        existing = self._entries.get(mapping_hash)
+        if existing is not None and existing != mapping:
+            raise ValueError("AttnSketch page-mapping digest collision")
+        self._entries[mapping_hash] = mapping
+        return mapping_hash
+
+    def resolve(self, mapping_hash: str) -> AttnSketchPageMapping:
+        _require_digest(mapping_hash, "page_mapping_hash")
+        try:
+            mapping = self._entries[mapping_hash]
+        except KeyError as exc:
+            raise ValueError("unknown AttnSketch page mapping") from exc
+        if mapping.mapping_hash != mapping_hash:
+            raise ValueError("AttnSketch page mapping failed digest verification")
+        return mapping
+
+
+def validate_attnsketch_page_mapping_identity(
+    *,
+    mapping_hash: str,
+    registry: AttnSketchPageMappingRegistry,
+    expected_request_id: str,
+    expected_request_slot: int,
+    expected_request_table_epoch: int,
+    expected_page_table_epoch: int,
+) -> AttnSketchPageMapping:
+    """Reject a page tensor whose allocator snapshot no longer matches."""
+
+    mapping = registry.resolve(mapping_hash)
+    observed = (
+        mapping.request_id,
+        mapping.request_slot,
+        mapping.request_table_epoch,
+        mapping.page_table_epoch,
+    )
+    expected = (
+        expected_request_id,
+        expected_request_slot,
+        expected_request_table_epoch,
+        expected_page_table_epoch,
+    )
+    if observed != expected:
+        raise ValueError("AttnSketch page mapping attribution mismatch")
+    return mapping
 
 
 class AttnSketchProvenanceRegistry:
@@ -223,8 +498,15 @@ def validate_attnsketch_export_identity(
 
 __all__ = [
     "ATTSKETCH_PROVENANCE_SCHEMA_VERSION",
+    "ATTSKETCH_TOKEN_FOCUS_SCHEMA_VERSION",
     "AttnSketchCaptureProvenance",
+    "AttnSketchPageGroup",
+    "AttnSketchPageMapping",
+    "AttnSketchPageMappingRegistry",
     "AttnSketchProvenanceRegistry",
     "AttnSketchRequestBinding",
+    "AttnSketchTokenFocusSchema",
     "validate_attnsketch_export_identity",
+    "validate_attnsketch_page_mapping_identity",
+    "validate_attnsketch_token_focus_provenance",
 ]

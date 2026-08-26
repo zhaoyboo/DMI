@@ -69,6 +69,17 @@ public:
     // + all hook metas.  Single lock on the FIFO.
     void push_step(StepContext* ctx, std::vector<TensorMeta>& metas);
 
+    // Cache immutable fixed-topology metadata once, then clone it directly in
+    // C++ on each replay.  This removes repeated Python list conversion from
+    // short CUDA-Graph telemetry paths.  The caller must still validate the
+    // dynamic request/page epochs before push_step_template().
+    uint64_t register_step_template(
+        StepContext* ctx, std::vector<TensorMeta>& metas);
+    void replace_step_template(
+        uint64_t template_id, StepContext* ctx,
+        std::vector<TensorMeta>& metas);
+    void push_step_template(uint64_t template_id);
+
     // Launch producer kernel unconditionally (no condition gating).
     // Space must be guaranteed by pre-forward capacity check.
     // Three variants matching the three torch ops.
