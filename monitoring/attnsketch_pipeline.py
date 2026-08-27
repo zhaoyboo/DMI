@@ -232,9 +232,11 @@ class AttnSketchTokenFocusTokenFlowSchema:
     The contiguous FP32 payload has shape
     ``[requests, layers, local_heads, 2*K+2+S]``.  The Top-K prefix is
     unchanged.  Every appended field is an exactly integral logical token ID
-    drawn from the complete attention distribution by native-split sampling
-    followed by bounded conditional replay.  Producers must fail closed when
-    the logical position domain exceeds FP32's exact-integer range ``[0,2**24)``.
+    drawn from the complete attention distribution.  The producer first
+    samples from the exact Top-K head; only a residual-tail draw uses native
+    split-mass sampling followed by bounded conditional replay.  Producers
+    must fail closed when the logical position domain exceeds FP32's
+    exact-integer range ``[0,2**24)``.
     """
 
     top_k: int
@@ -287,7 +289,7 @@ class AttnSketchTokenFocusTokenFlowSchema:
             "ordering": "probability_desc_token_id_asc_then_flow_samples",
             "flow_distribution": "categorical_full_attention_over_tokens",
             "flow_construction": (
-                "native_split_mass_sample_then_bounded_conditional_token_replay"
+                "exact_topk_mixture_then_native_split_residual_bounded_replay"
             ),
         }
         encoded = json.dumps(
