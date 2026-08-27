@@ -206,6 +206,10 @@ class ModelShapeConfig:
     # (token_id, probability) fields followed by coverage and tail mass.
     attn_token_focus_layers: int = 0
     attn_token_focus_top_k: int = 0
+    # Versioned extensions may append exact compact fields (for example flow
+    # region samples). Zero preserves the original 2*K+2 contract. A nonzero
+    # value is an exact ABI width and must be at least 2*K+2.
+    attn_token_focus_width: int = 0
     tp_size:      int = 1  # tensor parallel world size
     tp_rank:      int = 0  # this rank's TP index
 
@@ -395,7 +399,10 @@ def _compute_hook_shape(
         if request_rows < 1:
             return []
         local_heads = cfg.num_heads // tp
-        fields = 2 * cfg.attn_token_focus_top_k + 2
+        base_fields = 2 * cfg.attn_token_focus_top_k + 2
+        fields = cfg.attn_token_focus_width or base_fields
+        if fields < base_fields:
+            return []
         return [request_rows, cfg.attn_token_focus_layers, local_heads, fields]
     if hook_type == HOOK_TYPE_MLP_POST:
         if cfg.intermediate_dim == 0:
@@ -896,7 +903,10 @@ class RingTransport:
     def submit_attnsketch_token_focus(self, tensor: torch.Tensor) -> None:
         """Publish one exact compact token-focus tensor without conversion.
 
-        The native record has shape ``[request, layer, local_head, 2*K+2]``.
+        The base native record has shape
+        ``[request, layer, local_head, 2*K+2]``. A versioned schema may set
+        ``attn_token_focus_width`` to append compact fields whose semantics are
+        bound by capture provenance.
         Each rank stores interleaved FP32 ``(token_id, probability)`` pairs,
         followed by exact Top-K coverage and its unresolved tail mass.  The
         method deliberately accepts no generic summary width: changing K,
@@ -918,11 +928,17 @@ class RingTransport:
             for spec in self._active_specs
         ):
             raise RuntimeError("AttnSketch token-focus hook is not active")
+        base_fields = 2 * cfg.attn_token_focus_top_k + 2
+        fields = cfg.attn_token_focus_width or base_fields
+        if fields < base_fields:
+            raise RuntimeError(
+                "AttnSketch token-focus width is smaller than exact Top-K head"
+            )
         expected = (
             len(requests),
             cfg.attn_token_focus_layers,
             cfg.num_heads // cfg.tp_size,
-            2 * cfg.attn_token_focus_top_k + 2,
+            fields,
         )
         if tuple(tensor.shape) != expected:
             raise ValueError(

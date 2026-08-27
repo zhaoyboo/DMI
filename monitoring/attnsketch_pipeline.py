@@ -25,6 +25,7 @@ from typing import Iterable, Mapping
 
 ATTSKETCH_PROVENANCE_SCHEMA_VERSION = 1
 ATTSKETCH_TOKEN_FOCUS_SCHEMA_VERSION = 1
+ATTSKETCH_TOKEN_FOCUS_FLOW_SCHEMA_VERSION = 1
 _CAPTURE_PREFIX = "attnsketch:v1:"
 _REQUEST_PREFIX = "as1."
 _PAGE_MAPPING_PREFIX = "sha256:"
@@ -138,9 +139,94 @@ class AttnSketchTokenFocusSchema:
         return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+@dataclass(frozen=True)
+class AttnSketchTokenFocusFlowSchema:
+    """Exact Top-K head plus exact categorical flow-region samples.
+
+    The contiguous FP32 payload has shape
+    ``[requests, layers, local_heads, 2*K+2+S]``.  The first ``2*K+2``
+    fields retain :class:`AttnSketchTokenFocusSchema` exactly.  Each trailing
+    field is an exactly integral region ID sampled from attention mass over
+    the version-pinned FA2 native split partition.  Request sequence length
+    and the immutable split geometry reconstruct the sampled key interval.
+    """
+
+    top_k: int
+    layers: int
+    local_heads: int
+    flow_samples: int
+    flow_region_count: int
+    flow_tile_tokens: int = 128
+    schema_version: int = ATTSKETCH_TOKEN_FOCUS_FLOW_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version != ATTSKETCH_TOKEN_FOCUS_FLOW_SCHEMA_VERSION:
+            raise ValueError("unsupported AttnSketch token-focus-flow schema version")
+        if min(
+            self.top_k,
+            self.layers,
+            self.local_heads,
+            self.flow_samples,
+            self.flow_region_count,
+            self.flow_tile_tokens,
+        ) < 1:
+            raise ValueError("token-focus-flow dimensions must be positive")
+        if self.flow_samples > 16:
+            raise ValueError("token-focus-flow supports at most 16 samples")
+        if self.flow_region_count > 32:
+            raise ValueError("token-focus-flow supports at most 32 regions")
+
+    @property
+    def fields(self) -> tuple[str, ...]:
+        head = AttnSketchTokenFocusSchema(
+            top_k=self.top_k,
+            layers=self.layers,
+            local_heads=self.local_heads,
+        ).fields
+        return head + tuple(
+            f"flow_region_id_{sample}" for sample in range(self.flow_samples)
+        )
+
+    @property
+    def width(self) -> int:
+        return 2 * self.top_k + 2 + self.flow_samples
+
+    def expected_shape(self, requests: int) -> tuple[int, int, int, int]:
+        if requests < 1:
+            raise ValueError("token-focus-flow request count must be positive")
+        return (requests, self.layers, self.local_heads, self.width)
+
+    @property
+    def contract_hash(self) -> str:
+        document = {
+            "observable": "exact_token_topk_with_exact_attention_flow_regions",
+            "schema_version": self.schema_version,
+            "top_k": self.top_k,
+            "layers": self.layers,
+            "local_heads": self.local_heads,
+            "flow_samples": self.flow_samples,
+            "flow_region_count": self.flow_region_count,
+            "flow_tile_tokens": self.flow_tile_tokens,
+            "dtype": "float32",
+            "fields": self.fields,
+            "ordering": "probability_desc_token_id_asc_then_flow_samples",
+            "flow_distribution": (
+                "categorical_attention_mass_over_native_fa2_splits"
+            ),
+            "flow_region_mapping": (
+                "tiles_per_region=ceil(ceil(sequence_length/tile_tokens)/"
+                "flow_region_count)"
+            ),
+        }
+        encoded = json.dumps(
+            document, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
 def validate_attnsketch_token_focus_provenance(
     provenance: AttnSketchCaptureProvenance,
-    schema: AttnSketchTokenFocusSchema,
+    schema: AttnSketchTokenFocusSchema | AttnSketchTokenFocusFlowSchema,
 ) -> None:
     """Reject a capture whose declared metrics are not this exact schema."""
 
@@ -498,6 +584,7 @@ def validate_attnsketch_export_identity(
 
 __all__ = [
     "ATTSKETCH_PROVENANCE_SCHEMA_VERSION",
+    "ATTSKETCH_TOKEN_FOCUS_FLOW_SCHEMA_VERSION",
     "ATTSKETCH_TOKEN_FOCUS_SCHEMA_VERSION",
     "AttnSketchCaptureProvenance",
     "AttnSketchPageGroup",
@@ -506,6 +593,7 @@ __all__ = [
     "AttnSketchProvenanceRegistry",
     "AttnSketchRequestBinding",
     "AttnSketchTokenFocusSchema",
+    "AttnSketchTokenFocusFlowSchema",
     "validate_attnsketch_export_identity",
     "validate_attnsketch_page_mapping_identity",
     "validate_attnsketch_token_focus_provenance",

@@ -15,6 +15,7 @@ from monitoring.attnsketch_pipeline import (
     AttnSketchPageMappingRegistry,
     AttnSketchProvenanceRegistry,
     AttnSketchRequestBinding,
+    AttnSketchTokenFocusFlowSchema,
     AttnSketchTokenFocusSchema,
     validate_attnsketch_export_identity,
     validate_attnsketch_page_mapping_identity,
@@ -166,6 +167,51 @@ def test_attnsketch_token_focus_schema_binds_field_order_and_query_contract():
     )
     with pytest.raises(ValueError, match="field ordering"):
         validate_attnsketch_token_focus_provenance(wrong, schema)
+
+
+def test_attnsketch_token_focus_flow_schema_appends_versioned_region_ids():
+    schema = AttnSketchTokenFocusFlowSchema(
+        top_k=4,
+        layers=28,
+        local_heads=16,
+        flow_samples=2,
+        flow_region_count=8,
+    )
+    assert schema.expected_shape(1) == (1, 28, 16, 12)
+    assert schema.fields[-4:] == (
+        "coverage",
+        "tail_mass",
+        "flow_region_id_0",
+        "flow_region_id_1",
+    )
+    cfg = _config(attn_token_focus_width=schema.width)
+    assert _compute_hook_shape(
+        HOOK_TYPE_ATTN_TOKEN_FOCUS,
+        cfg,
+        batch=1,
+        q_len=1,
+        kv_dim=1024,
+    ) == [1, 28, 16, 12]
+    provenance = AttnSketchCaptureProvenance(
+        kernel_fingerprint=_digest("1"),
+        artifact_hash=_digest("2"),
+        manifest_version="fa2-v2.8.3-sm89-token-focus-flow-r1",
+        score_semantics_hash=_digest("3"),
+        semantic_mapping_version="attnsketch.exact-token-focus-flow.v1",
+        layout_hash=_digest("4"),
+        query_contract_hash=schema.contract_hash,
+        metrics=schema.fields,
+    )
+    validate_attnsketch_token_focus_provenance(provenance, schema)
+
+    with pytest.raises(ValueError, match="at most 32 regions"):
+        AttnSketchTokenFocusFlowSchema(
+            top_k=4,
+            layers=28,
+            local_heads=16,
+            flow_samples=1,
+            flow_region_count=33,
+        )
 
 
 def test_attnsketch_scope_summary_preflight_rejects_request_row_mismatch():
