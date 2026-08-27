@@ -17,6 +17,7 @@ from monitoring.attnsketch_pipeline import (
     AttnSketchRequestBinding,
     AttnSketchTokenFocusFlowSchema,
     AttnSketchTokenFocusSchema,
+    AttnSketchTokenFocusTokenFlowSchema,
     validate_attnsketch_export_identity,
     validate_attnsketch_page_mapping_identity,
     validate_attnsketch_token_focus_provenance,
@@ -167,6 +168,33 @@ def test_attnsketch_token_focus_schema_binds_field_order_and_query_contract():
     )
     with pytest.raises(ValueError, match="field ordering"):
         validate_attnsketch_token_focus_provenance(wrong, schema)
+
+
+def test_attnsketch_token_flow_schema_appends_exact_token_ids():
+    schema = AttnSketchTokenFocusTokenFlowSchema(
+        top_k=2,
+        layers=3,
+        local_heads=8,
+        flow_samples=2,
+    )
+    assert schema.expected_shape(1) == (1, 3, 8, 8)
+    assert schema.fields == (
+        "token_id_0",
+        "probability_0",
+        "token_id_1",
+        "probability_1",
+        "coverage",
+        "tail_mass",
+        "flow_token_id_0",
+        "flow_token_id_1",
+    )
+    assert schema.contract_hash != AttnSketchTokenFocusFlowSchema(
+        top_k=2,
+        layers=3,
+        local_heads=8,
+        flow_samples=2,
+        flow_region_count=8,
+    ).contract_hash
 
 
 def test_attnsketch_token_focus_flow_schema_appends_versioned_region_ids():
