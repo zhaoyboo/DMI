@@ -86,6 +86,16 @@ public:
     void rebind_and_push_step_template(
         uint64_t template_id, StepContext* ctx);
 
+    // Fast path for one fixed-size CUDA payload backed by one cached metadata
+    // template.  This combines the per-step capacity reservation, dynamic
+    // context rebind, metadata enqueue, static producer launch, and drain
+    // notification behind one Python/native boundary.  The tensor is still
+    // checked against the cached template before any ring space is reserved.
+    // Returns the same STEP_* status as prepare_step().
+    int publish_step_template_static(
+        uint64_t template_id, StepContext* ctx,
+        const at::Tensor& tensor, uint32_t hook_type);
+
     // Launch producer kernel unconditionally (no condition gating).
     // Space must be guaranteed by pre-forward capacity check.
     // Three variants matching the three torch ops.

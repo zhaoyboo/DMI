@@ -623,6 +623,36 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("req_ids"), py::arg("token_ranges"),
            py::arg("dim0_offsets"),
            py::arg("kv_offsets") = py::list())
+      .def("publish_step_template_static",
+           [](ring_py::RingEnginePy& self,
+              uint64_t template_id,
+              const std::string& model_id,
+              int32_t tp_rank,
+              int32_t dp_rank,
+              int32_t ep_rank,
+              int32_t pp_rank,
+              bool flattened,
+              py::list req_ids_py,
+              py::list token_ranges_py,
+              py::list dim0_offsets_py,
+              py::list kv_offsets_py,
+              const at::Tensor& tensor,
+              uint32_t hook_type) {
+             auto context = parse_step_context(
+                 model_id, tp_rank, dp_rank, ep_rank, pp_rank, flattened,
+                 req_ids_py, token_ranges_py, dim0_offsets_py, kv_offsets_py);
+             py::gil_scoped_release release;
+             return self.publish_step_template_static(
+                 template_id, context.release(), tensor, hook_type);
+           },
+           py::arg("template_id"),
+           py::arg("model_id"),
+           py::arg("tp_rank"), py::arg("dp_rank"),
+           py::arg("ep_rank"), py::arg("pp_rank"),
+           py::arg("flattened"),
+           py::arg("req_ids"), py::arg("token_ranges"),
+           py::arg("dim0_offsets"), py::arg("kv_offsets"),
+           py::arg("tensor"), py::arg("hook_type"))
       .def("set_null_mode",
            &ring_py::RingEnginePy::set_null_mode,
            py::arg("enabled"),

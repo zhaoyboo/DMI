@@ -1209,6 +1209,53 @@ class AttnSketchBoundScopeMetaTemplate:
             kv_offsets=kv_offsets,
         )
 
+    def publish_static(
+        self,
+        tensor: torch.Tensor,
+        *,
+        expected_requests: tuple[tuple[str, int, int], ...],
+    ) -> int:
+        """Publish one fixed-topology CUDA tensor through one native call.
+
+        Dynamic request/page attribution is validated on every invocation.
+        The native engine independently verifies tensor shape, dtype, device,
+        and hook type against the cached template before reserving ring space.
+        The return value uses the same STEP_* convention as ``prepare_step``.
+        """
+
+        requests, token_ranges, dim0_offsets, kv_offsets = (
+            self._validated_dynamic_context(
+                expected_requests=expected_requests,
+            )
+        )
+        transport = self.transport
+        result = int(
+            transport._ring_engine.publish_step_template_static(
+                self.template_id,
+                transport._current_model_id,
+                transport._current_tp_rank,
+                transport._current_dp_rank,
+                transport._current_ep_rank,
+                transport._current_pp_rank,
+                transport._current_flattened,
+                list(requests),
+                list(token_ranges),
+                list(dim0_offsets),
+                list(kv_offsets),
+                tensor,
+                self.expected_hook_type,
+            )
+        )
+        if result != 2:
+            self._adopt_dynamic_context(
+                expected_requests=expected_requests,
+                requests=requests,
+                token_ranges=token_ranges,
+                dim0_offsets=dim0_offsets,
+                kv_offsets=kv_offsets,
+            )
+        return result
+
     def push(self) -> None:
         """Validate all dynamic context, then clone the native template."""
 

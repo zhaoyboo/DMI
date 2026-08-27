@@ -174,6 +174,77 @@ void RingEnginePy::rebind_and_push_step_template(
     impl_->fifo.push_step(context, metas);
 }
 
+int RingEnginePy::publish_step_template_static(
+    uint64_t template_id, StepContext* ctx,
+    const at::Tensor& tensor, uint32_t hook_type) {
+    std::unique_ptr<StepContext> owned(ctx);
+    if (!tensor.defined() || !tensor.is_cuda() || !tensor.is_contiguous()) {
+        throw std::invalid_argument(
+            "cached DMI static publish requires a contiguous CUDA tensor");
+    }
+    if (tensor.device() != impl_->payload_view.device()) {
+        throw std::invalid_argument(
+            "cached DMI static publish tensor and ring must share a device");
+    }
+
+    // Snapshot the validated fixed topology before prepare_step() reserves
+    // ring capacity.  Do not look the template up a second time after the
+    // reservation: replace_step_template() is public, and a concurrent
+    // replacement between validation and enqueue must not change this
+    // publication's shape or hook contract.
+    std::vector<TensorMeta> metas;
+    {
+        std::lock_guard<std::mutex> lock(impl_->template_mu);
+        const auto it = impl_->step_templates.find(template_id);
+        if (it == impl_->step_templates.end()) {
+            throw std::invalid_argument("unknown DMI step template");
+        }
+        if (it->second.metas.size() != 1) {
+            throw std::invalid_argument(
+                "cached DMI static publish requires exactly one tensor meta");
+        }
+        const auto& meta = it->second.metas.front();
+        if (meta.hook_type != static_cast<int>(hook_type)) {
+            throw std::invalid_argument(
+                "cached DMI static publish hook type does not match template");
+        }
+        if (meta.dtype != static_cast<int>(tensor.scalar_type())) {
+            throw std::invalid_argument(
+                "cached DMI static publish dtype does not match template");
+        }
+        if (meta.shape.size() != static_cast<size_t>(tensor.dim())) {
+            throw std::invalid_argument(
+                "cached DMI static publish rank does not match template");
+        }
+        for (size_t dim = 0; dim < meta.shape.size(); ++dim) {
+            if (meta.shape[dim] != tensor.size(static_cast<int64_t>(dim))) {
+                throw std::invalid_argument(
+                    "cached DMI static publish shape does not match template");
+            }
+        }
+        metas = it->second.metas;
+    }
+
+    const uint64_t nbytes = static_cast<uint64_t>(tensor.nbytes());
+    const int result = prepare_step(nbytes, 1);
+    if (result == STEP_OVERSIZED) {
+        return result;
+    }
+
+    // Transfer context ownership only after capacity is available.  The
+    // dynamic context belongs to this publication; it need not mutate the
+    // cached fixed-topology template.  From this point onward the operation
+    // has the same fail-stop boundary as the existing metadata-then-producer
+    // path.
+    impl_->fifo.push_step(owned.release(), metas);
+    const auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
+    hook_no_notify(
+        reinterpret_cast<uint64_t>(tensor.data_ptr()), nbytes, hook_type,
+        reinterpret_cast<uint64_t>(stream.stream()));
+    notify_drain();
+    return result;
+}
+
 // ---------------------------------------------------------------------------
 // hook_no_notify (3 variants) -- unconditional producer launches.
 //

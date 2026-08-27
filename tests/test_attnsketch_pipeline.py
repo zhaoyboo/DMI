@@ -507,6 +507,125 @@ def test_bound_token_focus_template_rebinds_and_pushes_in_one_native_call():
     assert template.expected_token_ranges == ((8191, 8192),)
 
 
+def test_bound_token_focus_template_static_publish_uses_one_native_call():
+    from monitoring.ring_transport import RingTransport
+
+    class FakeTemplateEngine:
+        def register_step_template(self, *args):
+            self.registered = args
+            return 29
+
+        def publish_step_template_static(self, *args):
+            self.published = args
+            return 0
+
+    provenance = _provenance()
+    old = (("request-old", 7, 19),)
+    new = (("request-new", 8, 21),)
+    engine = FakeTemplateEngine()
+    transport = RingTransport.__new__(RingTransport)
+    transport._ring_engine = engine
+    transport._model_cfg = _config()
+    transport._active_specs = [
+        HookSpec(
+            HOOK_TYPE_ATTN_TOKEN_FOCUS,
+            None,
+            layer_no=-1,
+            dtype=torch.float32,
+        )
+    ]
+    transport._current_model_id = provenance.capture_id
+    transport._current_tp_rank = 0
+    transport._current_dp_rank = 0
+    transport._current_ep_rank = 0
+    transport._current_pp_rank = 0
+    transport._current_flattened = False
+    transport._current_req_ids = [AttnSketchRequestBinding(*old[0]).encode()]
+    transport._current_token_ranges = [(4095, 4096)]
+    transport._current_dim0_offsets = [0]
+    transport._current_kv_offsets = [0]
+
+    template = transport.register_attnsketch_bound_token_focus_meta_template(
+        capture_id=provenance.capture_id,
+        expected_requests=old,
+        batch=1,
+        q_len=1,
+        kv_dim=4096,
+        logits_to_keep=1,
+    )
+    tensor = torch.zeros(1, 28, 16, 10)
+    transport._current_req_ids = [AttnSketchRequestBinding(*new[0]).encode()]
+    transport._current_token_ranges = [(8191, 8192)]
+    transport._current_kv_offsets = [32]
+
+    assert template.publish_static(tensor, expected_requests=new) == 0
+    call = engine.published
+    assert call[0] == 29
+    assert call[-2] is tensor
+    assert call[-1] == HOOK_TYPE_ATTN_TOKEN_FOCUS
+    assert call[-6] == transport._current_req_ids
+    assert call[-5] == [(8191, 8192)]
+    assert call[-3] == [32]
+    assert template.expected_requests == new
+    assert template.expected_token_ranges == ((8191, 8192),)
+
+
+def test_bound_token_focus_template_static_publish_does_not_adopt_rejected_context():
+    from monitoring.ring_transport import RingTransport
+
+    class CapacityRejectingEngine:
+        def register_step_template(self, *args):
+            return 31
+
+        def publish_step_template_static(self, *args):
+            self.published = args
+            return 2
+
+    provenance = _provenance()
+    old = (("request-old", 7, 19),)
+    new = (("request-new", 8, 21),)
+    engine = CapacityRejectingEngine()
+    transport = RingTransport.__new__(RingTransport)
+    transport._ring_engine = engine
+    transport._model_cfg = _config()
+    transport._active_specs = [
+        HookSpec(
+            HOOK_TYPE_ATTN_TOKEN_FOCUS,
+            None,
+            layer_no=-1,
+            dtype=torch.float32,
+        )
+    ]
+    transport._current_model_id = provenance.capture_id
+    transport._current_tp_rank = 0
+    transport._current_dp_rank = 0
+    transport._current_ep_rank = 0
+    transport._current_pp_rank = 0
+    transport._current_flattened = False
+    transport._current_req_ids = [AttnSketchRequestBinding(*old[0]).encode()]
+    transport._current_token_ranges = [(4095, 4096)]
+    transport._current_dim0_offsets = [0]
+    transport._current_kv_offsets = [0]
+
+    template = transport.register_attnsketch_bound_token_focus_meta_template(
+        capture_id=provenance.capture_id,
+        expected_requests=old,
+        batch=1,
+        q_len=1,
+        kv_dim=4096,
+        logits_to_keep=1,
+    )
+    transport._current_req_ids = [AttnSketchRequestBinding(*new[0]).encode()]
+    transport._current_token_ranges = [(8191, 8192)]
+    transport._current_kv_offsets = [32]
+
+    assert template.publish_static(
+        torch.zeros(1, 28, 16, 10), expected_requests=new
+    ) == 2
+    assert template.expected_requests == old
+    assert template.expected_token_ranges == ((4095, 4096),)
+
+
 def test_bound_scope_expected_encoding_cache_is_bounded_under_churn():
     from monitoring.ring_transport import RingTransport
 
