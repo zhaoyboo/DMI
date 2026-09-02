@@ -26,6 +26,7 @@ from monitoring.ring_transport import (
     HOOK_TYPE_ATTN_SUMMARY,
     HOOK_TYPE_ATTN_SCOPE_SUMMARY,
     HOOK_TYPE_ATTN_TOKEN_FOCUS,
+    HOOK_TYPE_ATTN_REPLAY_CAPSULE,
     HookRowBasis,
     HookSpec,
     ModelShapeConfig,
@@ -65,6 +66,7 @@ def _config(**changes) -> ModelShapeConfig:
         attn_scope_summary_width=128,
         attn_token_focus_layers=28,
         attn_token_focus_top_k=4,
+        attn_replay_capsule_bytes=4096,
     )
     values.update(changes)
     return ModelShapeConfig(**values)
@@ -77,6 +79,10 @@ def test_attnsketch_hook_is_a_first_class_native_hook():
         == HOOK_TYPE_ATTN_SCOPE_SUMMARY
     )
     assert _id_by_short["attn_token_focus"] == HOOK_TYPE_ATTN_TOKEN_FOCUS
+    assert (
+        _id_by_short["attn_replay_capsule"]
+        == HOOK_TYPE_ATTN_REPLAY_CAPSULE
+    )
 
 
 def test_attnsketch_summary_shape_preserves_rows_heads_and_metric_width():
@@ -107,6 +113,29 @@ def test_attnsketch_scope_summary_is_request_scoped_without_head_axis():
         logits_to_keep=3,
     ) == [3, 128]
     assert hook_row_basis(HOOK_TYPE_ATTN_SCOPE_SUMMARY) is HookRowBasis.REQUEST_ROWS
+
+
+def test_attnsketch_replay_capsule_is_fixed_width_request_scoped_bytes():
+    cfg = _config()
+    assert _compute_hook_shape(
+        HOOK_TYPE_ATTN_REPLAY_CAPSULE,
+        cfg,
+        batch=2,
+        q_len=1,
+        kv_dim=4096,
+    ) == [2, 4096]
+    assert _compute_hook_shape(
+        HOOK_TYPE_ATTN_REPLAY_CAPSULE,
+        cfg,
+        batch=0,
+        q_len=7,
+        kv_dim=4096,
+        logits_to_keep=3,
+    ) == [3, 4096]
+    assert (
+        hook_row_basis(HOOK_TYPE_ATTN_REPLAY_CAPSULE)
+        is HookRowBasis.REQUEST_ROWS
+    )
 
 
 def test_attnsketch_token_focus_has_explicit_request_layer_head_rank_shape():
@@ -668,6 +697,20 @@ def test_missing_summary_width_disables_the_transport_hook():
         [focus_spec],
         "attn_token_focus",
         _config(attn_token_focus_top_k=0),
+    ) == []
+    capsule_spec = HookSpec(
+        HOOK_TYPE_ATTN_REPLAY_CAPSULE,
+        nn.Identity(),
+        layer_no=-1,
+        dtype=torch.uint8,
+    )
+    assert select_hook_specs(
+        [capsule_spec], "attn_replay_capsule", _config()
+    ) == [capsule_spec]
+    assert select_hook_specs(
+        [capsule_spec],
+        "attn_replay_capsule",
+        _config(attn_replay_capsule_bytes=0),
     ) == []
 
 

@@ -54,7 +54,8 @@ enum HookType : int {
     HOOK_TYPE_ATTN_SUMMARY = 24,
     HOOK_TYPE_ATTN_SCOPE_SUMMARY = 25,
     HOOK_TYPE_ATTN_TOKEN_FOCUS = 26,
-    HOOK_TYPE_COUNT        = 27,
+    HOOK_TYPE_ATTN_REPLAY_CAPSULE = 27,
+    HOOK_TYPE_COUNT        = 28,
 };
 
 // Hook group — which sub-block produces this tensor.
@@ -75,12 +76,14 @@ enum HookGroup : int { GROUP_ATTN = 0, GROUP_MLP = 1, GROUP_OTHER = 2 };
 //   SHAPE_ATTN_SUMMARY  : [batch, q_len, num_heads/tp, summary_width]
 //   SHAPE_ATTN_SCOPE_SUMMARY: [batch_or_requests, scope_summary_width]
 //   SHAPE_ATTN_TOKEN_FOCUS: [batch_or_requests, layers, num_heads/tp, 2*K+2]
+//   SHAPE_ATTN_REPLAY_CAPSULE: [batch_or_requests, fixed_capsule_bytes]
 enum ShapeClass : int {
     SHAPE_HIDDEN = 0, SHAPE_QKV_Q = 1, SHAPE_QKV_KV = 2, SHAPE_QKV_Z = 3,
     SHAPE_ATTN_WT = 4, SHAPE_MLP_POST = 5, SHAPE_TOKEN_IDS = 6, SHAPE_LOGITS = 7,
     SHAPE_ROUTER_LOGITS = 8, SHAPE_TOPK_IDS = 9, SHAPE_TOPK_WEIGHTS = 10,
     SHAPE_ATTN_SUMMARY = 11, SHAPE_ATTN_SCOPE_SUMMARY = 12,
     SHAPE_ATTN_TOKEN_FOCUS = 13,
+    SHAPE_ATTN_REPLAY_CAPSULE = 14,
 };
 
 // Pipeline-parallel stage placement.
@@ -125,6 +128,7 @@ static constexpr HookDef HOOK_DEFS[] = {
     {HOOK_TYPE_ATTN_SUMMARY,"attn.attnsketch_summary",  "attn_summary", true,  GROUP_ATTN,  true,  SHAPE_ATTN_SUMMARY, PP_ANY },
     {HOOK_TYPE_ATTN_SCOPE_SUMMARY,"attn.attnsketch_scope_summary", "attn_scope_summary", false, GROUP_ATTN, true, SHAPE_ATTN_SCOPE_SUMMARY, PP_ANY },
     {HOOK_TYPE_ATTN_TOKEN_FOCUS,"attn.attnsketch_token_focus", "attn_token_focus", false, GROUP_ATTN, true, SHAPE_ATTN_TOKEN_FOCUS, PP_ANY },
+    {HOOK_TYPE_ATTN_REPLAY_CAPSULE,"attn.attnsketch_replay_capsule", "attn_replay_capsule", false, GROUP_ATTN, true, SHAPE_ATTN_REPLAY_CAPSULE, PP_ANY },
 };
 static constexpr int HOOK_DEFS_COUNT = sizeof(HOOK_DEFS) / sizeof(HOOK_DEFS[0]);
 
@@ -194,7 +198,8 @@ inline bool is_request_scoped(int hook_type) {
             int shape = HOOK_DEFS[i].shape_class;
             FLAGS[HOOK_DEFS[i].id] =
                 shape == SHAPE_LOGITS || shape == SHAPE_ATTN_SCOPE_SUMMARY ||
-                shape == SHAPE_ATTN_TOKEN_FOCUS;
+                shape == SHAPE_ATTN_TOKEN_FOCUS ||
+                shape == SHAPE_ATTN_REPLAY_CAPSULE;
         }
         init = true;
     }

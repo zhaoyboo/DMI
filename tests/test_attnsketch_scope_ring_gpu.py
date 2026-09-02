@@ -10,6 +10,7 @@ from monitoring.attnsketch_pipeline import AttnSketchRequestBinding
 from monitoring.ring_transport import (
     HOOK_TYPE_ATTN_SCOPE_SUMMARY,
     HOOK_TYPE_ATTN_TOKEN_FOCUS,
+    HOOK_TYPE_ATTN_REPLAY_CAPSULE,
     HookSpec,
     ModelShapeConfig,
     RingTransport,
@@ -21,6 +22,135 @@ from monitoring.ring_transport import (
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required"
 )
+
+
+@pytest.mark.parametrize("requests", (1, 4))
+def test_replay_capsule_traverses_real_gpu_ring_as_opaque_request_bytes(
+    requests: int,
+) -> None:
+    width = 4096
+    config = _native_engine.RingConfig()
+    config.task_ring_entries = 1024
+    config.payload_ring_bytes = 1024 * 1024
+    config.pinned_staging_bytes = 1024 * 1024
+    config.drain_poll_timeout_us = 50
+    sink = _native_engine.InMemoryRingSink()
+    engine = _native_engine.RingEngine(config, sink)
+    engine.init()
+    engine.start()
+    transport = RingTransport(engine)
+    transport.set_model_cfg(
+        ModelShapeConfig(
+            hidden_dim=1024,
+            num_heads=8,
+            num_kv_heads=2,
+            head_dim=128,
+            dtype=torch.float16,
+            attn_replay_capsule_bytes=width,
+        )
+    )
+    transport.set_step_context(
+        model_id="attnsketch-replay-capsule-ring-test",
+        req_ids=[f"request-{index}" for index in range(requests)],
+        token_ranges=[(4095, 4096)] * requests,
+        dim0_offsets=list(range(requests)),
+        kv_offsets=[0] * requests,
+        flattened=False,
+    )
+    transport._active_specs = [
+        HookSpec(
+            HOOK_TYPE_ATTN_REPLAY_CAPSULE,
+            None,
+            layer_no=-1,
+            dtype=torch.uint8,
+        )
+    ]
+    source = torch.arange(
+        requests * width, device="cuda", dtype=torch.int64
+    ).remainder(251).to(torch.uint8).view(requests, width)
+    expected = source.clone()
+
+    activate(transport)
+    try:
+        assert engine.prepare_step(source.nbytes, 1) != 2
+        transport.pre_push_all_metas(
+            batch=requests,
+            q_len=1,
+            kv_dim=4096,
+            logits_to_keep=requests,
+        )
+        transport.submit_attnsketch_replay_capsule(source)
+        engine.notify_drain()
+        engine.flush_and_wait()
+        assert torch.equal(source, expected)
+        rows = sink.rows()
+        assert len(rows) == requests
+        for request_index, row in enumerate(rows):
+            assert row["activation_name"] == "attn.attnsketch_replay_capsule"
+            assert row["request_id"] == f"request-{request_index}"
+            assert (row["start_token"], row["end_token"]) == (4095, 4096)
+            assert torch.equal(
+                row["tensor"], expected[request_index : request_index + 1].cpu()
+            )
+    finally:
+        engine.stop()
+        deactivate()
+
+
+def test_already_offloaded_replay_capsule_traverses_dmi_host_pipeline() -> None:
+    width = 4096
+    config = _native_engine.RingConfig()
+    config.task_ring_entries = 32
+    config.payload_ring_bytes = 1024 * 1024
+    config.pinned_staging_bytes = 1024 * 1024
+    sink = _native_engine.InMemoryRingSink()
+    engine = _native_engine.RingEngine(config, sink)
+    engine.init()
+    engine.start()
+    transport = RingTransport(engine)
+    transport.set_model_cfg(
+        ModelShapeConfig(
+            hidden_dim=1024,
+            num_heads=8,
+            num_kv_heads=2,
+            head_dim=128,
+            dtype=torch.float16,
+            attn_replay_capsule_bytes=width,
+        )
+    )
+    transport.set_step_context(
+        model_id="attnsketch-replay-capsule-cpu-test",
+        req_ids=["request-0"],
+        token_ranges=[(4095, 4096)],
+        dim0_offsets=[0],
+        kv_offsets=[0],
+        flattened=False,
+    )
+    transport._active_specs = [
+        HookSpec(
+            HOOK_TYPE_ATTN_REPLAY_CAPSULE,
+            None,
+            layer_no=-1,
+            dtype=torch.uint8,
+        )
+    ]
+    source = torch.arange(width, dtype=torch.int64).remainder(251).to(torch.uint8)
+    source = source.view(1, width).contiguous()
+    transport.pre_push_all_metas(
+        batch=1,
+        q_len=1,
+        kv_dim=4096,
+        logits_to_keep=1,
+    )
+    transport.submit_attnsketch_replay_capsule_cpu(source)
+    engine.flush_and_wait()
+    try:
+        rows = sink.rows()
+        assert len(rows) == 1
+        assert rows[0]["activation_name"] == "attn.attnsketch_replay_capsule"
+        assert torch.equal(rows[0]["tensor"], source)
+    finally:
+        engine.stop()
 
 
 @pytest.mark.parametrize("requests", (1, 4))

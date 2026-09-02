@@ -66,6 +66,7 @@ SHAPE_ATTN_WT, SHAPE_MLP_POST, SHAPE_TOKEN_IDS, SHAPE_LOGITS = 4, 5, 6, 7
 SHAPE_ATTN_SUMMARY = 11
 SHAPE_ATTN_SCOPE_SUMMARY = 12
 SHAPE_ATTN_TOKEN_FOCUS = 13
+SHAPE_ATTN_REPLAY_CAPSULE = 14
 PP_ANY, PP_FIRST, PP_LAST = 0, 1, 2
 _ATTNSKETCH_ENCODING_CACHE_MAX = 128
 
@@ -139,6 +140,7 @@ def hook_row_basis(hook_type: int) -> HookRowBasis:
         SHAPE_LOGITS,
         SHAPE_ATTN_SCOPE_SUMMARY,
         SHAPE_ATTN_TOKEN_FOCUS,
+        SHAPE_ATTN_REPLAY_CAPSULE,
     ):
         return HookRowBasis.REQUEST_ROWS
     return HookRowBasis.TOKEN_ROWS
@@ -210,6 +212,10 @@ class ModelShapeConfig:
     # region samples). Zero preserves the original 2*K+2 contract. A nonzero
     # value is an exact ABI width and must be at least 2*K+2.
     attn_token_focus_width: int = 0
+    # Opaque, versioned replay record emitted once per observed request step.
+    # The payload is uint8 [request, fixed_capsule_bytes]; DMI transports it
+    # without interpreting Q, bound, LSE, or provenance fields.
+    attn_replay_capsule_bytes: int = 0
     tp_size:      int = 1  # tensor parallel world size
     tp_rank:      int = 0  # this rank's TP index
 
@@ -404,6 +410,13 @@ def _compute_hook_shape(
         if fields < base_fields:
             return []
         return [request_rows, cfg.attn_token_focus_layers, local_heads, fields]
+    if hook_type == HOOK_TYPE_ATTN_REPLAY_CAPSULE:
+        if cfg.attn_replay_capsule_bytes < 1:
+            return []
+        request_rows = batch if batch > 0 else logits_to_keep
+        if request_rows < 1:
+            return []
+        return [request_rows, cfg.attn_replay_capsule_bytes]
     if hook_type == HOOK_TYPE_MLP_POST:
         if cfg.intermediate_dim == 0:
             return []  # intermediate_dim unknown -- skip this hook
@@ -614,6 +627,7 @@ class RingTransport:
             if spec.hook_type in (
                 HOOK_TYPE_ATTN_SCOPE_SUMMARY,
                 HOOK_TYPE_ATTN_TOKEN_FOCUS,
+                HOOK_TYPE_ATTN_REPLAY_CAPSULE,
             ):
                 request_rows = batch if batch > 0 else logits_to_keep
                 if request_rows != len(self._current_req_ids):
@@ -959,6 +973,82 @@ class RingTransport:
             HOOK_TYPE_ATTN_TOKEN_FOCUS,
             -1,
         )
+
+    def submit_attnsketch_replay_capsule(self, tensor: torch.Tensor) -> None:
+        """Publish one fixed-width opaque replay capsule per request.
+
+        DMI deliberately does not interpret the byte payload.  AttnSketch
+        owns its version, checksums, kernel provenance and replay semantics;
+        this boundary only guarantees request-scoped, exact-byte transport.
+        No implicit cast or contiguous copy is permitted on the graph path.
+        """
+
+        cfg = self._model_cfg
+        requests = self._current_req_ids
+        if cfg is None or cfg.attn_replay_capsule_bytes < 1:
+            raise RuntimeError("AttnSketch replay-capsule shape is not configured")
+        if requests is None or not requests:
+            raise RuntimeError("AttnSketch replay-capsule request context is missing")
+        if not any(
+            spec.hook_type == HOOK_TYPE_ATTN_REPLAY_CAPSULE
+            for spec in self._active_specs
+        ):
+            raise RuntimeError("AttnSketch replay-capsule hook is not active")
+        expected = (len(requests), cfg.attn_replay_capsule_bytes)
+        if tuple(tensor.shape) != expected:
+            raise ValueError(
+                f"AttnSketch replay capsule must have shape {expected}, "
+                f"got {tuple(tensor.shape)}"
+            )
+        if (
+            not tensor.is_cuda
+            or tensor.dtype != torch.uint8
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError("AttnSketch replay capsule must be contiguous CUDA uint8")
+        if tensor.device != self._ring_payload.device:
+            raise ValueError("AttnSketch replay capsule and DMI ring must share a device")
+        torch.ops.ring.producer(
+            self._ring_payload,
+            tensor,
+            HOOK_TYPE_ATTN_REPLAY_CAPSULE,
+            -1,
+        )
+
+    def submit_attnsketch_replay_capsule_cpu(self, tensor: torch.Tensor) -> None:
+        """Submit an already offloaded capsule to DMI's host pipeline.
+
+        This is intentionally an off-path connector.  The caller must queue
+        the matching metadata first with ``pre_push_all_metas`` and must use a
+        transport whose sole active hook is the replay capsule.  Requiring a
+        single hook prevents a failed/partial multi-hook step from desynchronizing
+        DMI's metadata FIFO.
+        """
+
+        cfg = self._model_cfg
+        requests = self._current_req_ids
+        specs = tuple(self._active_specs)
+        if cfg is None or cfg.attn_replay_capsule_bytes < 1:
+            raise RuntimeError("AttnSketch replay-capsule shape is not configured")
+        if requests is None or not requests:
+            raise RuntimeError("AttnSketch replay-capsule request context is missing")
+        if len(specs) != 1 or specs[0].hook_type != HOOK_TYPE_ATTN_REPLAY_CAPSULE:
+            raise RuntimeError(
+                "CPU replay-capsule submission requires one active capsule hook"
+            )
+        expected = (len(requests), cfg.attn_replay_capsule_bytes)
+        if tuple(tensor.shape) != expected:
+            raise ValueError(
+                f"AttnSketch replay capsule must have shape {expected}, "
+                f"got {tuple(tensor.shape)}"
+            )
+        if (
+            tensor.device.type != "cpu"
+            or tensor.dtype != torch.uint8
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError("CPU replay capsule must be contiguous CPU uint8")
+        self._ring_engine.submit_cpu_direct(tensor)
 
     def submit_attnsketch_bound_token_focus(
         self,

@@ -88,3 +88,45 @@ with metrics `("argmax_logical_token_f32", "p_max")`. Its token index is
 transported as FP32 only because the manifested sequence length is below
 `2**24`; the capture layout hash and metric tuple make that convention
 explicit. DMI does not convert, reconstruct, or reinterpret either field.
+
+## K-independent deferred-replay capsules
+
+AttnSketch also defines a request-scoped opaque transport for deferred replay:
+
+```text
+activation name: attn.attnsketch_replay_capsule
+short name:      attn_replay_capsule
+shape:           [requests, fixed_capsule_bytes]
+dtype:           uint8
+```
+
+Set `ModelShapeConfig.attn_replay_capsule_bytes` and select the hook
+explicitly. A zero width disables it. The capsule is not a Top-K result. It is
+a versioned, checksum-protected AttnSketch record containing the captured Q
+bytes, producer bounds, inherited LSE, request/page epochs and kernel semantic
+fingerprints required by a deferred worker. Consequently, K, a token
+probability threshold, or a region aggregate can be chosen after transport
+without changing or recapturing the inference graph.
+
+DMI deliberately treats this tensor as opaque bytes. It neither interprets
+the replay contract nor reads KV. The graph-facing
+`submit_attnsketch_replay_capsule()` accepts only a preallocated contiguous
+CUDA `uint8` tensor with exactly one row per request. The off-path connector
+`submit_attnsketch_replay_capsule_cpu()` accepts an already copied contiguous
+CPU tensor and traverses the same native metadata, sink and attribution path;
+it requires the capsule hook to be the sole active hook for that queued
+metadata batch. Neither method performs an implicit cast, reshape or copy.
+
+The first AttnSketch integration drains its existing nonblocking device
+capture ring on a service thread, encodes one complete decode generation, and
+then submits the CPU capsule through DMI. A failed submission poisons that
+publisher and becomes an explicit observation gap; it must not leave DMI's
+metadata FIFO aligned by guesswork. The receiving worker authenticates the
+capsule and joins its request/page epochs against a byte-preserving KV-offload
+lease before replay. Compressed or requantized KV is outside this exact
+contract and fails closed.
+
+This hook has native-ring unit evidence for both CUDA-producer and already-
+offloaded CPU-producer entry points. It does not yet constitute a live vLLM
+serving performance claim, a remote deployment admission, or evidence that
+DMI transport is free. Those are separate integration measurements.

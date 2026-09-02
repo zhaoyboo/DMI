@@ -315,7 +315,8 @@ void P2PThread::do_post_processing(at::Tensor& tensor, const DrainTask& first_ta
             db_end   = req.end_token;
         }
         if ((meta.hook_type == ring_py::HOOK_TYPE_ATTN_SCOPE_SUMMARY ||
-             meta.hook_type == ring_py::HOOK_TYPE_ATTN_TOKEN_FOCUS)
+             meta.hook_type == ring_py::HOOK_TYPE_ATTN_TOKEN_FOCUS ||
+             meta.hook_type == ring_py::HOOK_TYPE_ATTN_REPLAY_CAPSULE)
             && slice.defined()) {
             db_start = req.end_token - 1;
             db_end = req.end_token;
