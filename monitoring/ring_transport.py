@@ -770,6 +770,29 @@ class RingTransport:
             logits_to_keep=logits_to_keep,
         )
 
+    def register_attnsketch_bound_replay_capsule_meta_template(
+        self,
+        *,
+        capture_id: str,
+        expected_requests: tuple[tuple[str, int, int], ...],
+        batch: int,
+        q_len: int,
+        kv_dim: int,
+        logits_to_keep: int = 0,
+    ) -> "AttnSketchBoundScopeMetaTemplate":
+        """Precompile one fixed-width replay-capsule metadata record."""
+
+        return self._register_attnsketch_bound_meta_template(
+            hook_type=HOOK_TYPE_ATTN_REPLAY_CAPSULE,
+            hook_name="replay-capsule",
+            capture_id=capture_id,
+            expected_requests=expected_requests,
+            batch=batch,
+            q_len=q_len,
+            kv_dim=kv_dim,
+            logits_to_keep=logits_to_keep,
+        )
+
     def _register_attnsketch_bound_meta_template(
         self,
         *,
@@ -1064,6 +1087,21 @@ class RingTransport:
             expected_requests=expected_requests,
         )
         self.submit_attnsketch_token_focus(tensor)
+
+    def submit_attnsketch_bound_replay_capsule(
+        self,
+        tensor: torch.Tensor,
+        *,
+        capture_id: str,
+        expected_requests: tuple[tuple[str, int, int], ...],
+    ) -> None:
+        """Publish one direct CUDA replay record after epoch validation."""
+
+        self.validate_attnsketch_bound_scope(
+            capture_id=capture_id,
+            expected_requests=expected_requests,
+        )
+        self.submit_attnsketch_replay_capsule(tensor)
 
     def submit_attnsketch_bound_scope_summary(
         self,
